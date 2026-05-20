@@ -257,6 +257,34 @@ class HomeViewModel @Inject constructor(
         )
     }
 
+    private fun needsContinueWatchingArtworkRepair(item: ContinueWatchingItem): Boolean {
+        return item.posterPath.isNullOrBlank() ||
+            item.backdropPath.isNullOrBlank() ||
+            item.overview.isBlank() ||
+            item.durationSeconds <= 0L
+    }
+
+    private suspend fun repairContinueWatchingMetadataIfNeeded(
+        items: List<ContinueWatchingItem>
+    ): List<ContinueWatchingItem> {
+        if (items.none(::needsContinueWatchingArtworkRepair)) return items
+        return runCatching {
+            traktRepository.enrichContinueWatchingItems(items)
+                .zip(items) { enriched, original ->
+                    mergeContinueWatchingVisuals(enriched, original)
+                }
+                .ifEmpty { items }
+        }.onFailure { error ->
+            AppLogger.recordException(
+                throwable = error,
+                context = mapOf(
+                    "error_area" to "ContinueWatching",
+                    "cw_phase" to "metadata_repair"
+                )
+            )
+        }.getOrDefault(items)
+    }
+
     private fun mergeTraktAndRecentLocalContinueWatching(
         traktItems: List<ContinueWatchingItem>,
         localItems: List<ContinueWatchingItem>,
@@ -2973,7 +3001,8 @@ class HomeViewModel @Inject constructor(
             traktRepository.getDismissedContinueWatchingShowKeys()
         }.getOrDefault(emptySet())
 
-        return sanitizeContinueWatchingItems(items)
+        val repairedItems = repairContinueWatchingMetadataIfNeeded(items)
+        return sanitizeContinueWatchingItems(repairedItems)
             .filterNot { item ->
                 val showKey = continueWatchingKey(item.mediaType, item.id)
                 dismissedContinueWatchingKeys.contains(showKey) || persistedDismissedKeys.contains(showKey)
@@ -3011,7 +3040,8 @@ class HomeViewModel @Inject constructor(
             traktRepository.getDismissedContinueWatchingShowKeys()
         }.getOrDefault(emptySet())
 
-        return sanitizeContinueWatchingItems(items)
+        val repairedItems = repairContinueWatchingMetadataIfNeeded(items)
+        return sanitizeContinueWatchingItems(repairedItems)
             .filterNot { item ->
                 val showKey = continueWatchingKey(item.mediaType, item.id)
                 dismissedContinueWatchingKeys.contains(showKey) || persistedDismissedKeys.contains(showKey)

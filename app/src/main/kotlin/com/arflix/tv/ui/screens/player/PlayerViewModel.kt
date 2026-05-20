@@ -50,6 +50,14 @@ import javax.inject.Inject
 private fun isSupplementalStream(stream: StreamSource): Boolean =
     stream.addonId == "iptv_xtream_vod" || stream.addonId == HomeServerRepository.ADDON_ID
 
+private const val PLAYBACK_DIAGNOSTICS = true
+
+private fun playbackDiag(message: String) {
+    if (PLAYBACK_DIAGNOSTICS) {
+        System.err.println("[PlaybackDiag] $message")
+    }
+}
+
 data class PlayerUiState(
     val isLoading: Boolean = true,
     val isLoadingStreams: Boolean = false,
@@ -297,6 +305,11 @@ class PlayerViewModel @Inject constructor(
         currentPreferredAddonId = preferredAddonId?.trim()?.takeIf { it.isNotBlank() }
         currentPreferredSourceName = preferredSourceName?.trim()?.takeIf { it.isNotBlank() }
         currentPreferredBingeGroup = preferredBingeGroup?.trim()?.takeIf { it.isNotBlank() }
+        playbackDiag(
+            "loadMedia type=$mediaType id=$mediaId season=$seasonNumber episode=$episodeNumber " +
+                "providedUrl=${!providedStreamUrl.isNullOrBlank()} preferredAddon=${currentPreferredAddonId.orEmpty()} " +
+                "preferredSource=${currentPreferredSourceName.orEmpty().take(120)}"
+        )
         currentEpisodeTitle = null
         hasMarkedWatched = false
         lastIsPlaying = false
@@ -339,22 +352,8 @@ class PlayerViewModel @Inject constructor(
         currentItemTitle = cachedItem?.title ?: ""
 
         viewModelScope.launch {
-            if (currentPreferredAddonId == null && currentPreferredSourceName == null && currentPreferredBingeGroup == null) {
-                streamRepository.getLastGoodPlaybackPreference(
-                    mediaType = mediaType,
-                    tmdbId = mediaId,
-                    season = seasonNumber,
-                    episode = episodeNumber
-                )?.let { preference ->
-                    currentPreferredAddonId = preference.addonId.takeIf { it.isNotBlank() }
-                    currentPreferredSourceName = preference.source.takeIf { it.isNotBlank() }
-                    currentPreferredBingeGroup = preference.bingeGroup?.takeIf { it.isNotBlank() }
-                    Log.i(
-                        TAG,
-                        "Using last good source preference addon=${currentPreferredAddonId ?: "-"} source=${currentPreferredSourceName ?: "-"} group=${currentPreferredBingeGroup ?: "-"}"
-                    )
-                }
-            }
+            // Autoplay should always use the current highest-ranked source list.
+            // Explicit source navigation still passes preferred fields or a URL below.
             val preferredAudioLanguage = resolvePreferredAudioLanguage()
             val frameRateMatchingMode = resolveFrameRateMatchingMode()
             val prefs = context.settingsDataStore.data.first()
@@ -428,6 +427,10 @@ class PlayerViewModel @Inject constructor(
                     runCatching { streamRepository.resolveStreamForPlayback(stream) }.getOrNull() ?: stream
                 }
                 val resolvedProvidedUrl = resolvedProvidedStream?.url ?: if (isMagnet) null else providedStreamUrl
+                playbackDiag(
+                    "providedStream resolved=${streamDiag(resolvedProvidedStream)} " +
+                        "host=${hostFromUrl(resolvedProvidedUrl)}"
+                )
 
                 if (resolvedProvidedUrl.isNullOrBlank()) {
                     AppLogger.recordException(
@@ -770,6 +773,10 @@ class PlayerViewModel @Inject constructor(
                                         TAG,
                                         "Autoplay selecting after quality window streams=${snapshot.size} elapsedMs=${System.currentTimeMillis() - collectionStartMs}"
                                     )
+                                    playbackDiag(
+                                        "autoplayDeferred streams=${snapshot.size} " +
+                                            "top=${snapshot.take(5).joinToString(" | ") { streamDiag(it) }}"
+                                    )
                                     autoplaySelectBest(snapshot, preferredLanguage)
                                 }
                             }
@@ -793,6 +800,10 @@ class PlayerViewModel @Inject constructor(
                         Log.i(
                             TAG,
                             "Autoplay selecting streams=${mergedStreams.size} completed=$completed/$total final=${progressive.isFinal} cached=$hasCachedReadyStream preferred=$hasRequestedPreferredStream elapsedMs=$elapsedMs top=${topStream?.quality}/${topStream?.size}"
+                        )
+                        playbackDiag(
+                            "autoplayNow streams=${mergedStreams.size} completed=$completed/$total final=${progressive.isFinal} " +
+                                "cached=$hasCachedReadyStream preferred=$hasRequestedPreferredStream top=${mergedStreams.take(5).joinToString(" | ") { streamDiag(it) }}"
                         )
                         autoplaySelectBest(mergedStreams, preferredLanguage)
                     }
@@ -1278,12 +1289,10 @@ class PlayerViewModel @Inject constructor(
         }
     }
 
-    /**
-     * Prioritize streams for real-world TV playback stability and startup speed.
-     * This reduces auto-picking very heavy remux/DV streams that often fail or buffer.
-     */
-    private fun playbackPriorityScore(stream: StreamSource): Int {
-        val text = buildString {
+    private fun streamSearchText(stream: StreamSource): String {
+        return buildString {
+            append(stream.quality)
+            append(' ')
             append(stream.source)
             append(' ')
             append(stream.addonName)
@@ -1292,13 +1301,25 @@ class PlayerViewModel @Inject constructor(
                 append(it)
             }
         }.lowercase()
+    }
 
-        // Quality is the PRIMARY signal — 4K beats 1080p beats 720p regardless of size.
+    private fun hostFromUrl(url: String?): String {
+        return runCatching { java.net.URI(url?.trim().orEmpty()).host.orEmpty() }.getOrDefault("")
+    }
+
+    private fun streamDiag(stream: StreamSource?): String {
+        stream ?: return "none"
+        return "addon=${stream.addonId.ifBlank { "-" }} q=${stream.quality.ifBlank { "-" }} " +
+            "size=${stream.size.ifBlank { "-" }} cached=${stream.behaviorHints?.cached == true} " +
+            "score=${playbackPriorityScore(stream)} src=${stream.source.take(90)}"
+    }
+
+    private fun playbackPriorityScore(stream: StreamSource): Int {
+        val text = streamSearchText(stream)
+
+        // Autoplay intentionally prefers the highest-quality source first.
         var score = qualityScore(stream.quality) * 1_000
 
-        // Within the same quality tier, prefer larger files because they usually
-        // indicate better bitrate/encodes. Do not cap huge files: autoplay should
-        // still pick the best source and let fast failover handle bad starts.
         val sizeBytes = parseSize(stream.size)
         score += when {
             sizeBytes <= 0L -> 0
@@ -1444,8 +1465,11 @@ class PlayerViewModel @Inject constructor(
     }
 
     private fun autoplaySelectBest(streams: List<StreamSource>, preferredLanguage: String) {
-        val healthyStreams = streams.filterNot { streamRepository.isPlaybackHostTemporarilyBad(it) }
-            .ifEmpty { streams }
+        val healthyStreams = streams
+        val hasExplicitPreferred =
+            !currentPreferredBingeGroup.isNullOrBlank() ||
+                !currentPreferredAddonId.isNullOrBlank() ||
+                !currentPreferredSourceName.isNullOrBlank()
         val preferredFromBingeGroup = currentPreferredBingeGroup?.let { preferredGroup ->
             healthyStreams.firstOrNull { stream ->
                 stream.behaviorHints?.bingeGroup == preferredGroup &&
@@ -1455,7 +1479,7 @@ class PlayerViewModel @Inject constructor(
             }
         }
 
-        val preferredFromNavigation = healthyStreams.firstOrNull { s ->
+        val preferredNavigationCandidate = healthyStreams.firstOrNull { s ->
             val addonMatch = currentPreferredAddonId?.let { s.addonId == it } ?: true
             val sourceMatch = currentPreferredSourceName?.let { s.source == it } ?: true
             addonMatch && sourceMatch
@@ -1464,7 +1488,16 @@ class PlayerViewModel @Inject constructor(
         }
 
         val stabilitySelected = pickPreferredStream(healthyStreams, preferredLanguage)
-        val selected = preferredFromBingeGroup ?: preferredFromNavigation ?: stabilitySelected ?: healthyStreams.first()
+        val selected = if (hasExplicitPreferred) {
+            preferredFromBingeGroup ?: preferredNavigationCandidate ?: stabilitySelected ?: healthyStreams.first()
+        } else {
+            stabilitySelected ?: healthyStreams.first()
+        }
+        playbackDiag(
+            "autoplaySelected selected=${streamDiag(selected)} " +
+                "preferredNavigation=${streamDiag(preferredNavigationCandidate)} " +
+                "usedPreferred=${hasExplicitPreferred && (selected === preferredFromBingeGroup || selected === preferredNavigationCandidate)}"
+        )
         selectStream(selected)
     }
 
@@ -1480,7 +1513,10 @@ class PlayerViewModel @Inject constructor(
             val groupMatch = preferredGroup?.let { stream.behaviorHints?.bingeGroup == it } ?: true
             val addonMatch = preferredAddon?.let { stream.addonId == it } ?: true
             val sourceMatch = preferredSource?.let { stream.source == it } ?: true
-            groupMatch && addonMatch && sourceMatch && !stream.url.isNullOrBlank()
+            groupMatch &&
+                addonMatch &&
+                sourceMatch &&
+                !stream.url.isNullOrBlank()
         }
     }
 
@@ -1508,7 +1544,7 @@ class PlayerViewModel @Inject constructor(
         preferredLanguage: String
     ): List<StreamSource> {
         return streams.sortedWith(
-            compareByDescending<StreamSource> { qualityScore(it.quality) }
+            compareByDescending<StreamSource> { playbackPriorityScore(it) }
                 .thenBy { streamRepository.getPlaybackHostHealthPenalty(it) }
                 .thenByDescending { parseSize(it.size) }
                 .thenByDescending { streamLanguageScore(it, preferredLanguage) }
@@ -1762,6 +1798,7 @@ class PlayerViewModel @Inject constructor(
             val selectionStartMs = System.currentTimeMillis()
             val requestedResumePosition = resumePositionMs?.coerceAtLeast(0L)
             val selectedOriginal = stream
+            playbackDiag("selectStream request=${streamDiag(stream)}")
             val resolvedResult = runCatching {
                 streamRepository.resolveStreamForPlayback(stream)
             }
@@ -1801,6 +1838,10 @@ class PlayerViewModel @Inject constructor(
             Log.i(
                 TAG,
                 "Selected stream resolvedMs=$resolveMs addon=${resolvedStream.addonId} quality=${resolvedStream.quality} size=${resolvedStream.size} cached=${resolvedStream.behaviorHints?.cached == true} host=${runCatching { java.net.URI(url).host }.getOrNull().orEmpty()}"
+            )
+            playbackDiag(
+                "selectStream resolvedMs=$resolveMs resolved=${streamDiag(resolvedStream)} " +
+                    "host=${hostFromUrl(url)}"
             )
             AppLogger.breadcrumb(
                 tag = "Playback",
@@ -2664,15 +2705,21 @@ class PlayerViewModel @Inject constructor(
 
         val updated = (latest + validVodSources)
             .distinctBy { "${it.url?.trim().orEmpty()}|${it.source}" }
+        val preferredLanguage = _uiState.value.preferredAudioLanguage.ifBlank { "en" }
+        val sortedStreams = sortStreamsByQualityAndSize(updated, preferredLanguage)
+        val shouldAutoplayVod = _uiState.value.selectedStreamUrl.isNullOrBlank()
         _uiState.value = _uiState.value.copy(
-            streams = updated,
+            streams = sortedStreams,
             isLoadingStreams = false,
             error = null,
             isSetupError = false,
             streamProgress = null,
             streamLoadPhase = null
         )
-        prewarmTopStreams(updated, _uiState.value.preferredAudioLanguage.ifBlank { "en" })
+        prewarmTopStreams(sortedStreams, preferredLanguage)
+        if (shouldAutoplayVod) {
+            pickPreferredStream(sortedStreams, preferredLanguage)?.let { selectStream(it) }
+        }
     }
 
     private suspend fun populateStreamsForProvidedUrl(
@@ -2734,17 +2781,31 @@ class PlayerViewModel @Inject constructor(
             val mergedStreams = (allStreams + existingVod)
                 .distinctBy { "${it.url?.trim().orEmpty()}|${it.source}" }
 
-            val selectedMatch = mergedStreams.firstOrNull { stream ->
+            val preferredLanguage = _uiState.value.preferredAudioLanguage.ifBlank { "en" }
+            val sortedStreams = sortStreamsByQualityAndSize(mergedStreams, preferredLanguage)
+            val selectedMatch = sortedStreams.firstOrNull { stream ->
                 isSameStreamUrl(stream.url, playbackUrl)
             }
 
+            val shouldAutoplay = _uiState.value.selectedStreamUrl.isNullOrBlank()
             val prevSource = _uiState.value.selectedStream?.source.orEmpty()
-            val newSource = (selectedMatch ?: _uiState.value.selectedStream)?.source.orEmpty()
+            val selectedForState = if (shouldAutoplay) {
+                _uiState.value.selectedStream
+            } else {
+                selectedMatch ?: _uiState.value.selectedStream
+            }
+            val newSource = selectedForState?.source.orEmpty()
             _uiState.value = _uiState.value.copy(
-                streams = mergedStreams,
-                selectedStream = selectedMatch ?: _uiState.value.selectedStream,
-                isLoadingStreams = false
+                streams = sortedStreams,
+                selectedStream = selectedForState,
+                isLoadingStreams = false,
+                streamProgress = null,
+                streamLoadPhase = null
             )
+            prewarmTopStreams(sortedStreams, preferredLanguage)
+            if (shouldAutoplay) {
+                pickPreferredStream(sortedStreams, preferredLanguage)?.let { selectStream(it) }
+            }
             // Re-run subtitle selection if stream source just became known
             if (prevSource.isBlank() && newSource.isNotBlank()) {
                 scheduleSubtitleSelection(currentOriginalLanguage)
