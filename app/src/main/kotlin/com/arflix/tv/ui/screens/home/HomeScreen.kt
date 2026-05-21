@@ -1691,7 +1691,7 @@ private fun HomeHeroLayer(
         val contentRowBottomPadding = 12.dp
         val contentRowTopPadding = contentRowHeight + contentRowBottomPadding
         val buttonsBottomPadding = contentRowTopPadding - 10.dp
-        val heroBottomPadding = buttonsBottomPadding + if (configuration.screenHeightDp < 720) 46.dp else 58.dp
+        val heroBottomPadding = buttonsBottomPadding + if (configuration.screenHeightDp < 720) 34.dp else 34.dp
 
         Box(
             modifier = Modifier
