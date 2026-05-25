@@ -1196,7 +1196,8 @@ private fun DetailsContent(
             }
             ?: ""
         val hasDuration = item.duration.isNotEmpty() && item.duration != "0m"
-        val rating = item.imdbRating.ifEmpty { item.tmdbRating }
+        val displayRating = displayRatingFor(item)
+        val rating = displayRating.value
         val ratingValue = parseRatingValue(rating)
         val buttonWatched = if (item.mediaType == MediaType.TV) {
             episodes.getOrNull(episodeIndex)?.isWatched ?: item.isWatched
@@ -1315,8 +1316,9 @@ private fun DetailsContent(
                                 .horizontalScroll(rememberScrollState())
                         ) {
                             if (ratingValue > 0f) {
-                                DetailsImdbSvgRatingBadge(
+                                DetailsSourceRatingBadge(
                                     rating = rating,
+                                    isImdbRating = displayRating.isImdb,
                                     imageLoader = metadataLogoImageLoader,
                                     ratingFontSize = 13,
                                     logoWidth = 34.dp,
@@ -1826,7 +1828,8 @@ private fun DetailsContent(
                 val isCompactHeight = configuration.screenHeightDp < 720
                 val displayDate = item.releaseDate?.takeIf { it.isNotEmpty() } ?: item.year
                 val hasDuration = item.duration.isNotEmpty() && item.duration != "0m"
-                val rating = item.imdbRating.ifEmpty { item.tmdbRating }
+                val displayRating = displayRatingFor(item)
+                val rating = displayRating.value
                 val ratingValue = parseRatingValue(rating)
                 val primaryNetworkLogo = item.primaryNetworkLogo?.takeIf { it.isNotBlank() }
                 val budgetText = budget?.trim()?.takeIf { it.isNotEmpty() && item.mediaType == MediaType.MOVIE }
@@ -1892,8 +1895,9 @@ private fun DetailsContent(
 
                     if (ratingValue > 0f) {
                         Text(text = "|", style = separatorStyle, color = Color.White.copy(alpha = 0.7f))
-                        DetailsImdbSvgRatingBadge(
+                        DetailsSourceRatingBadge(
                             rating = rating,
+                            isImdbRating = displayRating.isImdb,
                             imageLoader = metadataLogoImageLoader,
                             ratingFontSize = 13,
                             logoWidth = 34.dp,
@@ -2889,6 +2893,51 @@ private fun HomeStyleRowAutoScroll(
     }
 }
 
+private data class DisplayRating(val value: String, val isImdb: Boolean)
+
+private fun displayRatingFor(item: MediaItem): DisplayRating {
+    val imdbValue = parseRatingValue(item.imdbRating)
+    if (imdbValue > 0f) return DisplayRating(item.imdbRating, isImdb = true)
+
+    val tmdbValue = parseRatingValue(item.tmdbRating)
+    return if (tmdbValue > 0f) {
+        DisplayRating(item.tmdbRating, isImdb = false)
+    } else {
+        DisplayRating("", isImdb = false)
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun DetailsSourceRatingBadge(
+    rating: String,
+    isImdbRating: Boolean,
+    imageLoader: ImageLoader,
+    ratingFontSize: Int,
+    logoWidth: Dp,
+    logoHeight: Dp,
+    textShadow: Shadow
+) {
+    if (isImdbRating) {
+        DetailsImdbSvgRatingBadge(
+            rating = rating,
+            imageLoader = imageLoader,
+            ratingFontSize = ratingFontSize,
+            logoWidth = logoWidth,
+            logoHeight = logoHeight,
+            textShadow = textShadow
+        )
+    } else {
+        DetailsTmdbRatingBadge(
+            rating = rating,
+            ratingFontSize = ratingFontSize,
+            logoWidth = logoWidth,
+            logoHeight = logoHeight,
+            textShadow = textShadow
+        )
+    }
+}
+
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
 private fun DetailsImdbSvgRatingBadge(
@@ -2913,6 +2962,48 @@ private fun DetailsImdbSvgRatingBadge(
                 .width(logoWidth)
                 .height(logoHeight)
         )
+        Text(
+            text = rating,
+            style = ArflixTypography.caption.copy(
+                fontSize = ratingFontSize.sp,
+                fontWeight = FontWeight.Bold,
+                shadow = textShadow
+            ),
+            color = Color.White,
+            maxLines = 1
+        )
+    }
+}
+
+@Composable
+private fun DetailsTmdbRatingBadge(
+    rating: String,
+    ratingFontSize: Int,
+    logoWidth: Dp,
+    logoHeight: Dp,
+    textShadow: Shadow
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(3.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .width(logoWidth)
+                .height(logoHeight)
+                .background(Color(0xFF01B4E4), RoundedCornerShape(3.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = "TMDb",
+                style = ArflixTypography.caption.copy(
+                    fontSize = (ratingFontSize - 4).coerceAtLeast(7).sp,
+                    fontWeight = FontWeight.Black
+                ),
+                color = Color.Black,
+                maxLines = 1
+            )
+        }
         Text(
             text = rating,
             style = ArflixTypography.caption.copy(

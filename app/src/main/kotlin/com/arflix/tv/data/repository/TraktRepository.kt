@@ -1630,7 +1630,7 @@ class TraktRepository @Inject constructor(
                             backdropPath = details.backdropPath?.let { "${Constants.BACKDROP_BASE_LARGE}$it" },
                             posterPath = details.posterPath?.let { "${Constants.IMAGE_BASE}$it" },
                             overview = details.overview ?: "",
-                            imdbRating = String.format("%.1f", details.voteAverage),
+                            tmdbRating = String.format(Locale.US, "%.1f", details.voteAverage),
                             duration = details.runtime?.let { formatRuntime(it) } ?: item.duration,
                             durationSeconds = maxOf(item.durationSeconds, runtimeMinutesToSeconds(details.runtime))
                         )
@@ -1651,7 +1651,7 @@ class TraktRepository @Inject constructor(
                             backdropPath = details.backdropPath?.let { "${Constants.BACKDROP_BASE_LARGE}$it" },
                             posterPath = details.posterPath?.let { "${Constants.IMAGE_BASE}$it" },
                             overview = details.overview ?: "",
-                            imdbRating = String.format("%.1f", details.voteAverage),
+                            tmdbRating = String.format(Locale.US, "%.1f", details.voteAverage),
                             duration = details.episodeRunTime.firstOrNull()?.let { "${it}m" } ?: item.duration,
                             durationSeconds = maxOf(item.durationSeconds, runtimeMinutesToSeconds(details.episodeRunTime.firstOrNull())),
                             totalEpisodes = item.totalEpisodes,
@@ -2183,7 +2183,7 @@ class TraktRepository @Inject constructor(
                     backdropPath = backdropUrl ?: item.backdropPath,  // Show backdrop, not episode still
                     posterPath = posterUrl ?: item.posterPath,
                     year = details?.firstAirDate?.take(4) ?: item.year,
-                    imdbRating = details?.voteAverage?.let { String.format("%.1f", it) } ?: item.imdbRating,
+                    tmdbRating = details?.voteAverage?.let { String.format(Locale.US, "%.1f", it) } ?: item.tmdbRating.orEmpty(),
                     duration = runtimeMinutes?.let { "${it}m" } ?: item.duration,
                     durationSeconds = maxOf(item.durationSeconds, runtimeMinutesToSeconds(runtimeMinutes)),
                     episodeTitle = item.episodeTitle ?: episodeInfo?.name,
@@ -2204,7 +2204,7 @@ class TraktRepository @Inject constructor(
                     backdropPath = backdropUrl ?: item.backdropPath,
                     posterPath = posterUrl ?: item.posterPath,
                     year = details?.releaseDate?.take(4) ?: item.year,
-                    imdbRating = details?.voteAverage?.let { String.format("%.1f", it) } ?: item.imdbRating,
+                    tmdbRating = details?.voteAverage?.let { String.format(Locale.US, "%.1f", it) } ?: item.tmdbRating.orEmpty(),
                     duration = details?.runtime?.let { formatRuntime(it) } ?: item.duration,
                     durationSeconds = maxOf(item.durationSeconds, runtimeMinutesToSeconds(details?.runtime))
                 )
@@ -2701,7 +2701,7 @@ class TraktRepository @Inject constructor(
                         subtitle = "Movie",
                         overview = details.overview ?: "",
                         year = details.releaseDate?.take(4) ?: "",
-                        imdbRating = String.format("%.1f", details.voteAverage),
+                        tmdbRating = String.format(Locale.US, "%.1f", details.voteAverage),
                         mediaType = MediaType.MOVIE,
                         image = details.posterPath?.let { "${Constants.IMAGE_BASE}$it" }
                             ?: details.backdropPath?.let { "${Constants.BACKDROP_BASE}$it" } ?: "",
@@ -2722,7 +2722,7 @@ class TraktRepository @Inject constructor(
                         subtitle = "TV Series",
                         overview = details.overview ?: "",
                         year = details.firstAirDate?.take(4) ?: "",
-                        imdbRating = String.format("%.1f", details.voteAverage),
+                        tmdbRating = String.format(Locale.US, "%.1f", details.voteAverage),
                         mediaType = MediaType.TV,
                         image = details.posterPath?.let { "${Constants.IMAGE_BASE}$it" }
                             ?: details.backdropPath?.let { "${Constants.BACKDROP_BASE}$it" } ?: "",
@@ -3749,6 +3749,7 @@ data class ContinueWatchingItem(
     val isUpNext: Boolean = false,
     val overview: String = "",
     val imdbRating: String = "",
+    val tmdbRating: String = "",
     val duration: String = "",
     val budget: Long? = null,
     val updatedAtMs: Long = 0L,
@@ -3815,7 +3816,8 @@ data class ContinueWatchingItem(
             overview = overview,
             year = year,
             releaseDate = releaseDate,
-            imdbRating = imdbRating,
+            imdbRating = "",
+            tmdbRating = tmdbRating.orEmpty().ifBlank { imdbRating.orEmpty() },
             duration = duration,
             mediaType = mediaType,
             progress = progress,

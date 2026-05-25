@@ -481,6 +481,17 @@ class DetailsViewModel @Inject constructor(
                         val prefetchEpisode = if (mediaType == MediaType.TV) (initialEpisode ?: 1) else null
                         prefetchStreamsInBackground(imdbId, prefetchSeason, prefetchEpisode)
 
+                        launch {
+                            val imdbRating = runCatching {
+                                mediaRepository.getImdbRating(mediaType, mediaId, imdbId)
+                            }.getOrNull()
+                            if (!imdbRating.isNullOrBlank()) {
+                                updateState { state ->
+                                    state.copy(item = state.item?.copy(imdbRating = imdbRating))
+                                }
+                            }
+                        }
+
                     } else if (tvdbId != null) {
                         updateState { state -> state.copy(tvdbId = tvdbId) }
                     }
