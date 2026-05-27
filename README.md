@@ -31,11 +31,6 @@ It is not intended as an advertising page, download landing page, or content dis
 - Profile PINs and custom profile avatars
 - ExoPlayer/Media3 playback with TV remote, mobile, and tablet controls
 
-## Recent Highlights
-
-Recent 1.9.91 and 1.9.92 work focused on IPTV category handling, large-list TV navigation, watchlist and continue-watching reliability, catalog discovery, home-server sources/catalogs, profile avatar sync, mobile layout fixes, player navigation, and Play/GitHub policy cleanup.
-
-For full release history, see [CHANGELOG.md](CHANGELOG.md).
 
 ## Availability
 
