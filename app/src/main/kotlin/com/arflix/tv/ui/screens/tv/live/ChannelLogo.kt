@@ -5,10 +5,14 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -42,52 +46,55 @@ fun ChannelLogo(
     val variant = (channel.name.firstOrNull()?.code ?: 0) % 3
     val context = LocalContext.current
     val density = LocalDensity.current
+    val logoUrl = channel.logo
+    var showFallback by remember(logoUrl) { mutableStateOf(logoUrl.isNullOrBlank()) }
     Box(
         modifier = modifier
             .size(size)
             .clip(RoundedCornerShape((size.value / 5.5f).dp))
-            .background(channel.brandBg),
+            .background(if (logoUrl.isNullOrBlank()) channel.brandBg else LiveColors.Panel),
         contentAlignment = Alignment.Center,
     ) {
-        when (variant) {
-            0 -> Text(
-                initials,
-                style = LiveType.ChannelName.copy(
-                    color = channel.brandFg,
-                    fontSize = (size.value * 0.34f).sp,
-                    fontWeight = FontWeight.W700,
-                    letterSpacing = 0.sp,
-                ),
-            )
-            1 -> Text(
-                initials,
-                style = LiveType.ChannelName.copy(
-                    color = channel.brandFg,
-                    fontSize = (size.value * 0.32f).sp,
-                    fontWeight = FontWeight.W600,
-                    letterSpacing = 0.sp,
-                ),
-            )
-            else -> Text(
-                initials,
-                style = LiveType.ChannelName.copy(
-                    color = channel.brandFg,
-                    fontSize = (size.value * 0.33f).sp,
-                    fontWeight = FontWeight.W600,
-                    letterSpacing = 0.sp,
-                ),
-            )
+        if (showFallback) {
+            when (variant) {
+                0 -> Text(
+                    initials,
+                    style = LiveType.ChannelName.copy(
+                        color = channel.brandFg,
+                        fontSize = (size.value * 0.34f).sp,
+                        fontWeight = FontWeight.W700,
+                        letterSpacing = 0.sp,
+                    ),
+                )
+                1 -> Text(
+                    initials,
+                    style = LiveType.ChannelName.copy(
+                        color = channel.brandFg,
+                        fontSize = (size.value * 0.32f).sp,
+                        fontWeight = FontWeight.W600,
+                        letterSpacing = 0.sp,
+                    ),
+                )
+                else -> Text(
+                    initials,
+                    style = LiveType.ChannelName.copy(
+                        color = channel.brandFg,
+                        fontSize = (size.value * 0.33f).sp,
+                        fontWeight = FontWeight.W600,
+                        letterSpacing = 0.sp,
+                    ),
+                )
+            }
+            if (variant == 0) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .height((size.value / 22f).coerceAtLeast(2f).dp)
+                        .fillMaxWidth(0.6f)
+                        .background(LiveColors.Accent),
+                )
+            }
         }
-        if (variant == 0) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .height((size.value / 22f).coerceAtLeast(2f).dp)
-                    .fillMaxWidth(0.6f)
-                    .background(LiveColors.Accent),
-            )
-        }
-        val logoUrl = channel.logo
         if (!logoUrl.isNullOrBlank()) {
             val logoRequest = remember(logoUrl, size, density) {
                 val px = with(density) { size.roundToPx() }.coerceAtLeast(1)
@@ -105,7 +112,11 @@ fun ChannelLogo(
                 model = logoRequest,
                 contentDescription = null,
                 contentScale = ContentScale.Fit,
-                modifier = Modifier.fillMaxSize(),
+                onSuccess = { showFallback = false },
+                onError = { showFallback = true },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding((size.value / 7f).coerceIn(4f, 8f).dp),
             )
         }
     }
