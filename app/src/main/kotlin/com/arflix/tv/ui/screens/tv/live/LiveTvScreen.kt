@@ -766,19 +766,7 @@ fun LiveTvScreen(
         exitFullScreenPlayback()
     }
     BackHandler(enabled = !searchOpen && !isFullScreen) {
-        when (focusZone) {
-            LiveTvFocusZone.EPG -> focusChannelList(focusedChannelId ?: playingChannelId)
-            LiveTvFocusZone.CHANNEL_LIST -> {
-                if (isTouchDevice) onBack()
-                else focusPlaylistSearch()
-            }
-            LiveTvFocusZone.CATEGORY_LIST -> {
-                if (isTouchDevice) {
-                    onBack()
-                }
-            }
-            LiveTvFocusZone.TOPBAR -> onBack()
-        }
+        onBack()
     }
 
     Box(
