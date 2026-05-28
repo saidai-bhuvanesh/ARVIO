@@ -87,6 +87,7 @@ import com.arflix.tv.ui.components.topBarSelectedIndex
 import com.arflix.tv.util.LocalDeviceType
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -119,6 +120,7 @@ private fun digitForTvKeyCode(keyCode: Int): Int? = when (keyCode) {
 
 private fun chooseStartupChannelId(
     filteredChannels: List<EnrichedChannel>,
+    filteredChannelIds: Set<String>,
     explicitInitialChannelId: String?,
     sessionLastChannelId: String,
     hasOpenedBefore: Boolean,
@@ -126,18 +128,18 @@ private fun chooseStartupChannelId(
     isFullyEnriched: Boolean,
 ): String? {
     explicitInitialChannelId
-        ?.takeIf { id -> filteredChannels.any { it.id == id } }
+        ?.takeIf { id -> id in filteredChannelIds }
         ?.let { return it }
     if (explicitInitialChannelId != null && !isFullyEnriched) return null
 
     favoriteChannelIds
-        .firstOrNull { id -> filteredChannels.any { it.id == id } }
+        .firstOrNull { id -> id in filteredChannelIds }
         ?.let { return it }
     if (favoriteChannelIds.isNotEmpty() && !isFullyEnriched) return null
 
     if (hasOpenedBefore) {
         sessionLastChannelId
-            .takeIf { id -> id.isNotBlank() && filteredChannels.any { it.id == id } }
+            .takeIf { id -> id.isNotBlank() && id in filteredChannelIds }
             ?.let { return it }
 
         if (sessionLastChannelId.isNotBlank() && !isFullyEnriched) return null
@@ -314,7 +316,7 @@ fun LiveTvScreen(
             if (selectedProviderId == "all") {
                 current.all
             } else {
-                current.all.filter { providerMatches(it, selectedProviderId, state.config) }
+                current.all.filter(providerMatcher(selectedProviderId, state.config))
             }
         }
         val index = withContext(Dispatchers.Default) { buildCategoryIndex(visibleChannels) }
@@ -359,15 +361,47 @@ fun LiveTvScreen(
     }
     val visibleChannels = visibleEnrichedState.value.all
     val variantGroups = remember(visibleChannels) { buildVariantGroups(visibleChannels) }
+    val allDisplayChannels = remember(visibleChannels, variantGroups) {
+        collapseChannelVariants(visibleChannels, variantGroups)
+    }
+    val allDisplayChannelIndexById = remember(allDisplayChannels) {
+        HashMap<String, Int>(allDisplayChannels.size).apply {
+            allDisplayChannels.forEachIndexed { index, channel -> put(channel.id, index) }
+        }
+    }
     val filteredChannels = remember(filteredChannelsState.value, variantGroups) {
         collapseChannelVariants(filteredChannelsState.value, variantGroups)
+    }
+    val filteredChannelIndexById = remember(filteredChannels) {
+        HashMap<String, Int>(filteredChannels.size).apply {
+            filteredChannels.forEachIndexed { index, channel -> put(channel.id, index) }
+        }
     }
     val visibleChannelsById = visibleEnrichedState.value.index.byId
     // Playing channel — default to the one we were navigated to, else the first
     // channel of the first non-empty category.
+    val rememberedChannelByCategory = remember { mutableMapOf<String, String>() }
     var playingChannelId by rememberSaveable { mutableStateOf<String?>(initialChannelId) }
     var focusedChannelId by rememberSaveable { mutableStateOf<String?>(initialChannelId) }
     var playingCatchupProgram by remember { mutableStateOf<IptvProgram?>(null) }
+    val focusCommitScope = rememberCoroutineScope()
+    val pendingFocusCommit = remember { arrayOf<Pair<String, String>?>(null) }
+    val focusCommitJob = remember { arrayOf<Job?>(null) }
+    fun commitFocusedChannel(channel: EnrichedChannel) {
+        pendingFocusCommit[0] = channel.id to selectedCategoryId
+        focusCommitJob[0]?.cancel()
+        focusCommitJob[0] = focusCommitScope.launch {
+            delay(70L)
+            val (channelId, categoryId) = pendingFocusCommit[0] ?: return@launch
+            if (focusedChannelId != channelId) {
+                focusedChannelId = channelId
+            }
+            rememberedChannelByCategory[categoryId] = channelId
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose { focusCommitJob[0]?.cancel() }
+    }
     val selectedDisplayChannelId = remember(focusedChannelId, playingChannelId, visibleChannelsById, variantGroups) {
         displayChannelIdFor(focusedChannelId ?: playingChannelId, visibleChannelsById, variantGroups)
     }
@@ -392,36 +426,31 @@ fun LiveTvScreen(
     }
 
     val epgAnchorChannelId = selectedDisplayChannelId ?: focusedChannelId ?: playingChannelId
-    val epgPrefetchIds = remember(filteredChannels, selectedCategoryId, epgAnchorChannelId) {
+    val epgPrefetchIds = remember(filteredChannels, filteredChannelIndexById, selectedCategoryId, epgAnchorChannelId) {
         val maxPrefetch = if (selectedCategoryId == "all") 96 else 180
-        val anchorIndex = epgAnchorChannelId
-            ?.let { id -> filteredChannels.indexOfFirst { channel -> channel.id == id } }
-            ?.takeIf { it >= 0 }
-            ?: 0
+        val anchorIndex = epgAnchorChannelId?.let(filteredChannelIndexById::get) ?: 0
         buildList<String> {
             filteredChannels.getOrNull(anchorIndex)?.id?.let { add(it) }
-            filteredChannels
-                .asSequence()
-                .drop(anchorIndex + 1)
-                .map { it.id }
-                .take((maxPrefetch - size).coerceAtLeast(0))
-                .forEach { add(it) }
-            filteredChannels
-                .asSequence()
-                .take(anchorIndex)
-                .toList()
-                .asReversed()
-                .asSequence()
-                .map { it.id }
-                .take(minOf(24, (maxPrefetch - size).coerceAtLeast(0)))
-                .forEach { add(it) }
-            filteredChannels
-                .asSequence()
-                .map { it.id }
-                .filterNot { it == epgAnchorChannelId }
-                .filterNot { contains(it) }
-                .take((maxPrefetch - size).coerceAtLeast(0))
-                .forEach { add(it) }
+            var index = anchorIndex + 1
+            while (index < filteredChannels.size && size < maxPrefetch) {
+                add(filteredChannels[index].id)
+                index++
+            }
+            var backIndex = anchorIndex - 1
+            var backCount = 0
+            while (backIndex >= 0 && backCount < 24 && size < maxPrefetch) {
+                add(filteredChannels[backIndex].id)
+                backIndex--
+                backCount++
+            }
+            index = 0
+            while (index < filteredChannels.size && size < maxPrefetch) {
+                val id = filteredChannels[index].id
+                if (id != epgAnchorChannelId && !contains(id)) {
+                    add(id)
+                }
+                index++
+            }
         }
     }
     LaunchedEffect(selectedCategoryId, epgPrefetchIds, epgAnchorChannelId) {
@@ -454,12 +483,13 @@ fun LiveTvScreen(
     // Pick the startup channel only after saved IPTV preferences/session have
     // loaded. Favorites win over a stale recent channel, then we fall back to
     // the persisted recent channel, then the first filtered entry.
-    LaunchedEffect(filteredChannels, playingChannelId, initialChannelId, state.tvSession, state.snapshot.favoriteChannels, visibleEnrichedState.value.all.size, state.iptvPreferencesLoaded, state.tvSessionLoaded, selectedProviderId) {
+    LaunchedEffect(filteredChannels, filteredChannelIndexById, playingChannelId, initialChannelId, state.tvSession, state.snapshot.favoriteChannels, visibleEnrichedState.value.all.size, state.iptvPreferencesLoaded, state.tvSessionLoaded, selectedProviderId) {
         val startupStateReady = state.iptvPreferencesLoaded && state.tvSessionLoaded
         val playingVisible = playingChannelId?.let { id -> id in visibleEnrichedState.value.index.byId } == true
         if ((!playingVisible || playingChannelId == null) && filteredChannels.isNotEmpty() && (initialChannelId != null || startupStateReady)) {
             playingChannelId = chooseStartupChannelId(
                 filteredChannels = filteredChannels,
+                filteredChannelIds = filteredChannelIndexById.keys,
                 explicitInitialChannelId = initialChannelId?.takeIf { selectedProviderId == "all" || it in visibleEnrichedState.value.index.byId },
                 sessionLastChannelId = state.tvSession.lastChannelId,
                 hasOpenedBefore = state.tvSession.lastOpenedAt > 0L,
@@ -467,9 +497,9 @@ fun LiveTvScreen(
                 isFullyEnriched = visibleEnrichedState.value.all.isNotEmpty(),
             )
         }
-        if (focusedChannelId == null || filteredChannels.none { it.id == focusedChannelId }) {
+        if (focusedChannelId == null || focusedChannelId !in filteredChannelIndexById) {
             focusedChannelId = displayChannelIdFor(playingChannelId, visibleEnrichedState.value.index.byId, variantGroups)
-                ?.takeIf { id -> filteredChannels.any { it.id == id } }
+                ?.takeIf { id -> id in filteredChannelIndexById }
                 ?: filteredChannels.firstOrNull()?.id
         }
     }
@@ -479,7 +509,6 @@ fun LiveTvScreen(
     var focusSelectedChannelSignal by remember { mutableIntStateOf(0) }
     var focusEpgSignal by remember { mutableIntStateOf(0) }
     var focusSearchCategorySignal by remember { mutableIntStateOf(1) }
-    val rememberedChannelByCategory = remember { mutableMapOf<String, String>() }
     // Full-screen playback mode — pressing OK on an EPG row expands the
     // mini-player to cover the whole screen. Back collapses back to the grid.
     var isFullScreen by rememberSaveable { mutableStateOf(initialStreamUrl != null) }
@@ -541,10 +570,10 @@ fun LiveTvScreen(
     // Prev/next zapping across the full enriched list (not the filtered
     // category) per user spec. Wraps around.
     fun zap(delta: Int) {
-        val all = collapseChannelVariants(visibleEnrichedState.value.all, variantGroups)
+        val all = allDisplayChannels
         if (all.isEmpty()) return
         val currentDisplayId = displayChannelIdFor(playingChannelId, visibleEnrichedState.value.index.byId, variantGroups)
-        val currentIdx = all.indexOfFirst { it.id == currentDisplayId }
+        val currentIdx = currentDisplayId?.let(allDisplayChannelIndexById::get) ?: -1
         val start = if (currentIdx >= 0) currentIdx else 0
         val size = all.size
         val nextIdx = ((start + delta) % size + size) % size
@@ -1087,10 +1116,7 @@ fun LiveTvScreen(
                             selectChannel(channel)
                         },
                         onProgramSelect = { channel, program -> playProgramInMini(channel, program) },
-                        onChannelFocused = { channel ->
-                            focusedChannelId = channel.id
-                            rememberedChannelByCategory[selectedCategoryId] = channel.id
-                        },
+                        onChannelFocused = { channel -> commitFocusedChannel(channel) },
                         onChannelFavoriteToggle = { id -> viewModel.toggleFavoriteChannel(id) },
                         favorites = favSet,
                         variantCountFor = { channel -> variantCountFor(channel, variantGroups) },
@@ -1133,10 +1159,10 @@ fun LiveTvScreen(
                     },
                     onMoveRight = {
                         val remembered = rememberedChannelByCategory[selectedCategoryId]
-                            ?.takeIf { id -> filteredChannels.any { it.id == id } }
+                            ?.takeIf { id -> id in filteredChannelIndexById }
                         val target = remembered
-                            ?: focusedChannelId?.takeIf { id -> filteredChannels.any { it.id == id } }
-                            ?: playingChannelId?.takeIf { id -> filteredChannels.any { it.id == id } }
+                            ?: focusedChannelId?.takeIf { id -> id in filteredChannelIndexById }
+                            ?: playingChannelId?.takeIf { id -> id in filteredChannelIndexById }
                             ?: filteredChannels.firstOrNull()?.id
                         focusChannelList(target)
                     },
@@ -1215,10 +1241,7 @@ fun LiveTvScreen(
                         gridFocused = focusZone == LiveTvFocusZone.CHANNEL_LIST || focusZone == LiveTvFocusZone.EPG,
                         onChannelSelect = { channel, _ -> selectChannel(channel) },
                         onProgramSelect = { channel, program -> playProgramInMini(channel, program) },
-                        onChannelFocused = { channel ->
-                            focusedChannelId = channel.id
-                            rememberedChannelByCategory[selectedCategoryId] = channel.id
-                        },
+                        onChannelFocused = { channel -> commitFocusedChannel(channel) },
                         onChannelFavoriteToggle = { id -> viewModel.toggleFavoriteChannel(id) },
                         favorites = favSet,
                         variantCountFor = { channel -> variantCountFor(channel, variantGroups) },
@@ -1388,7 +1411,7 @@ fun LiveTvScreen(
             modifier = Modifier.fillMaxSize(),
         ) {
             SearchOverlay(
-                channels = collapseChannelVariants(visibleEnrichedState.value.all, variantGroups),
+                channels = allDisplayChannels,
                 nowNext = state.snapshot.nowNext,
                 onDismiss = { searchOpen = false },
                 onPick = { channel ->

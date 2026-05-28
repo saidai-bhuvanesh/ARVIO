@@ -22,10 +22,9 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -107,9 +106,15 @@ fun EpgGrid(
     val channelColumnWidth = if (compact) 164.dp else LiveDims.EpgChannelColWidth
     val halfHourWidth = (pxPerMin * 30f).dp
     val rowHeight = if (compact) 52.dp else LiveDims.EpgRowHeight
-    val channelFocusRequesters = remember { mutableStateMapOf<String, FocusRequester>() }
-    val programFocusRequesters = remember { mutableStateMapOf<String, List<FocusRequester>>() }
-    val programFocusTargets = remember { mutableStateMapOf<String, List<ProgramFocusTarget>>() }
+    val channelFocusRequesters = remember { LinkedHashMap<String, FocusRequester>() }
+    val programFocusRequesters = remember { LinkedHashMap<String, List<FocusRequester>>() }
+    val programFocusTargets = remember { LinkedHashMap<String, List<ProgramFocusTarget>>() }
+    val channelIndexById = remember(channels) {
+        HashMap<String, Int>(channels.size).apply {
+            channels.forEachIndexed { index, channel -> put(channel.id, index) }
+        }
+    }
+    val selectedChannel = selectedChannelId?.let { id -> channelIndexById[id]?.let { index -> channels.getOrNull(index) } }
 
     val maxCatchupDays = remember(channels) {
         channels.maxOfOrNull { ch -> effectiveCatchupDays(ch) } ?: 0
@@ -167,6 +172,11 @@ fun EpgGrid(
         activeChannelFocusId = channel.id
         pendingChannelFocusId = channel.id
         onChannelFocused(channel)
+        channelFocusRequesters[channel.id]?.let { requester ->
+            if (runCatching { requester.requestFocus() }.isSuccess) {
+                return true
+            }
+        }
         scope.launch {
             channelListState.scrollToItem(rowIdx)
             delay(16L)
@@ -187,10 +197,9 @@ fun EpgGrid(
 
     fun moveChannelFocus(delta: Int): Boolean {
         val anchorId = activeChannelFocusId ?: selectedChannelId
-        val anchorIdx = anchorId?.let { id -> channels.indexOfFirst { it.id == id } }
-            ?.takeIf { it >= 0 }
-            ?: channels.indexOfFirst { it.id == selectedChannelId }
-        if (anchorIdx < 0) return true
+        val anchorIdx = anchorId?.let(channelIndexById::get)
+            ?: selectedChannelId?.let(channelIndexById::get)
+            ?: return true
         return keepChannelFocus(anchorIdx + delta)
     }
 
@@ -201,8 +210,7 @@ fun EpgGrid(
     LaunchedEffect(selectedChannelId, channels) {
         if (didPositionInitialSelection) return@LaunchedEffect
         val id = selectedChannelId ?: return@LaunchedEffect
-        val idx = channels.indexOfFirst { it.id == id }
-        if (idx < 0) return@LaunchedEffect
+        val idx = channelIndexById[id] ?: return@LaunchedEffect
         channelListState.scrollToItem(idx)
         didPositionInitialSelection = true
     }
@@ -210,8 +218,7 @@ fun EpgGrid(
     LaunchedEffect(focusSelectedChannelSignal, selectedChannelId, channels) {
         if (focusSelectedChannelSignal == 0) return@LaunchedEffect
         val id = selectedChannelId ?: return@LaunchedEffect
-        val idx = channels.indexOfFirst { it.id == id }
-        if (idx < 0) return@LaunchedEffect
+        val idx = channelIndexById[id] ?: return@LaunchedEffect
         channelListState.scrollToItem(idx)
         runCatching { selectedChannelFocusRequester.requestFocus() }
     }
@@ -219,8 +226,7 @@ fun EpgGrid(
     LaunchedEffect(focusEpgSignal, selectedChannelId, channels, windowStartMillis) {
         if (focusEpgSignal == 0) return@LaunchedEffect
         val id = selectedChannelId ?: return@LaunchedEffect
-        val idx = channels.indexOfFirst { it.id == id }
-        if (idx < 0) return@LaunchedEffect
+        val idx = channelIndexById[id] ?: return@LaunchedEffect
         val nowMin = ((clockTickMillis - windowStartMillis) / 60_000L).toInt()
         repeat(6) {
             if (requestNearestProgramFocus(idx, nowMin)) return@LaunchedEffect
@@ -264,9 +270,8 @@ fun EpgGrid(
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("CH", style = LiveType.SectionTag.copy(color = LiveColors.Accent))
-                    val currentNumber = channels.firstOrNull { it.id == selectedChannelId }?.number
                     Text(
-                        currentNumber?.toString() ?: "—",
+                        selectedChannel?.number?.toString() ?: "—",
                         style = LiveType.NumberMono.copy(color = LiveColors.Accent),
                     )
                 }
@@ -339,7 +344,7 @@ fun EpgGrid(
                             return@onKeyEvent false
                         }
                         if (focusMode == EpgGridFocusMode.Epg) {
-                            onExitEpg(selectedChannelId?.let { id -> channels.firstOrNull { it.id == id } })
+                            onExitEpg(selectedChannel)
                             selectedChannelFocusRequester.requestFocus()
                         } else {
                             onMoveLeftFromChannels()
@@ -359,8 +364,15 @@ fun EpgGrid(
                         contentType = { _, _ -> "channelRowAndPrograms" }
                     ) { idx, ch ->
                         val channelFocusRequester = remember(ch.id) { FocusRequester() }
-                        SideEffect {
+                        val locallyFocused = ch.id == activeChannelFocusId &&
+                            focusMode == EpgGridFocusMode.ChannelList
+                        DisposableEffect(ch.id, channelFocusRequester) {
                             channelFocusRequesters[ch.id] = channelFocusRequester
+                            onDispose {
+                                if (channelFocusRequesters[ch.id] === channelFocusRequester) {
+                                    channelFocusRequesters.remove(ch.id)
+                                }
+                            }
                         }
                         Row(
                             modifier = Modifier
@@ -370,7 +382,7 @@ fun EpgGrid(
                             // 1. Channel item (fixed width, doesn't scroll horizontally)
                             ChannelRow(
                                 channel = ch,
-                                isActive = ch.id == selectedChannelId,
+                                isActive = ch.id == selectedChannelId || (gridFocused && locallyFocused),
                                 clockTickMillis = clockTickMillis,
                                 nowNext = nowNext[ch.id],
                                 isFavorite = ch.id in favorites,
@@ -402,9 +414,7 @@ fun EpgGrid(
                                 variantCount = variantCountFor(ch),
                                 onOpenVariants = { onOpenVariants(ch) },
                                 rowHeight = rowHeight,
-                                forceFocused = gridFocused &&
-                                    focusMode == EpgGridFocusMode.ChannelList &&
-                                    ch.id == selectedChannelId,
+                                forceFocused = gridFocused && locallyFocused,
                                 modifier = Modifier
                                     .width(channelColumnWidth)
                                     .background(LiveColors.PanelDeep)
@@ -564,6 +574,11 @@ private fun ProgramsRow(
                 if (canFocus) index else null
             }
         }
+        val focusableIndexByPlacementIndex = remember(focusablePlacementIndices) {
+            focusablePlacementIndices
+                .withIndex()
+                .associate { (focusIndex, placementIndex) -> placementIndex to focusIndex }
+        }
         val rowFocusRequesters = remember(channel.id, focusablePlacementIndices.size) {
             List(focusablePlacementIndices.size) { FocusRequester() }
         }
@@ -574,16 +589,24 @@ private fun ProgramsRow(
                 }
             }
         }
-        SideEffect {
+        DisposableEffect(channel.id, rowFocusRequesters, rowFocusTargets) {
             focusRequesters[channel.id] = rowFocusRequesters
             focusTargets[channel.id] = rowFocusTargets
+            onDispose {
+                if (focusRequesters[channel.id] === rowFocusRequesters) {
+                    focusRequesters.remove(channel.id)
+                }
+                if (focusTargets[channel.id] === rowFocusTargets) {
+                    focusTargets.remove(channel.id)
+                }
+            }
         }
         if (placements.isNotEmpty()) {
             placements.forEachIndexed { placementIndex, placement ->
                 val offset = (placement.startMin * pxPerMin).dp
                 val width = (placement.durationMin * pxPerMin).dp
                 val isCatchupSupported = placement.isCatchupSupported(channel, nowMillis)
-                val focusableIndex = focusablePlacementIndices.indexOf(placementIndex)
+                val focusableIndex = focusableIndexByPlacementIndex[placementIndex] ?: -1
                 val isFocusable = focusableIndex >= 0
                 ProgramCell(
                     program = placement.program,
@@ -767,20 +790,14 @@ private fun buildProgramPlacements(
         if (program.startUtcMillis > cursor) {
             val gapEnd = minOf(program.startUtcMillis, windowEndMillis)
             if (gapEnd > cursor) {
-                // Clamp placeholder start to at most 60 mins before now to avoid horizontal scroll jumps
-                var placeholderStart = maxOf(cursor, nowMillis - 60 * 60_000L)
-                while (placeholderStart < gapEnd) {
-                    val blockEnd = minOf(placeholderStart + 60 * 60_000L, gapEnd)
-                    placements += ProgramPlacement(
-                        program = IptvProgram(placeholderTitle, startUtcMillis = placeholderStart, endUtcMillis = blockEnd),
-                        startMin = ((placeholderStart - windowStartMillis) / 60_000L).toInt(),
-                        durationMin = ((blockEnd - placeholderStart) / 60_000L).toInt().coerceAtLeast(1),
-                        isNow = nowMillis in placeholderStart until blockEnd,
-                        isPast = blockEnd <= nowMillis,
-                        isPlaceholder = true,
-                    )
-                    placeholderStart = blockEnd
-                }
+                addPlaceholderPlacement(
+                    placements = placements,
+                    title = placeholderTitle,
+                    gapStart = cursor,
+                    gapEnd = gapEnd,
+                    windowStartMillis = windowStartMillis,
+                    nowMillis = nowMillis,
+                )
                 cursor = gapEnd
             }
         }
@@ -804,21 +821,43 @@ private fun buildProgramPlacements(
 
     // 3. Fill trailing gap
     if (cursor < windowEndMillis) {
-        // Clamp placeholder start to at most 60 mins before now to avoid horizontal scroll jumps
-        var placeholderStart = maxOf(cursor, nowMillis - 60 * 60_000L)
-        while (placeholderStart < windowEndMillis) {
-            val blockEnd = minOf(placeholderStart + 60 * 60_000L, windowEndMillis)
-            placements += ProgramPlacement(
-                program = IptvProgram(placeholderTitle, startUtcMillis = placeholderStart, endUtcMillis = blockEnd),
-                startMin = ((placeholderStart - windowStartMillis) / 60_000L).toInt(),
-                durationMin = ((blockEnd - placeholderStart) / 60_000L).toInt().coerceAtLeast(1),
-                isNow = nowMillis in placeholderStart until blockEnd,
-                isPast = blockEnd <= nowMillis,
-                isPlaceholder = true,
-            )
-            placeholderStart = blockEnd
-        }
+        addPlaceholderPlacement(
+            placements = placements,
+            title = placeholderTitle,
+            gapStart = cursor,
+            gapEnd = windowEndMillis,
+            windowStartMillis = windowStartMillis,
+            nowMillis = nowMillis,
+        )
     }
 
     return placements
+}
+
+private fun addPlaceholderPlacement(
+    placements: MutableList<ProgramPlacement>,
+    title: String,
+    gapStart: Long,
+    gapEnd: Long,
+    windowStartMillis: Long,
+    nowMillis: Long,
+) {
+    if (gapEnd <= gapStart) return
+    val anchor = nowMillis.coerceIn(gapStart, gapEnd - 1L)
+    val preferredStart = anchor - 30L * 60_000L
+    val placeholderStart = preferredStart
+        .coerceAtLeast(gapStart)
+        .coerceAtMost((gapEnd - 1L).coerceAtLeast(gapStart))
+    val placeholderEnd = minOf(
+        gapEnd,
+        maxOf(placeholderStart + 60L * 60_000L, anchor + 30L * 60_000L)
+    )
+    placements += ProgramPlacement(
+        program = IptvProgram(title, startUtcMillis = placeholderStart, endUtcMillis = placeholderEnd),
+        startMin = ((placeholderStart - windowStartMillis) / 60_000L).toInt(),
+        durationMin = ((placeholderEnd - placeholderStart) / 60_000L).toInt().coerceAtLeast(1),
+        isNow = nowMillis in placeholderStart until placeholderEnd,
+        isPast = placeholderEnd <= nowMillis,
+        isPlaceholder = true,
+    )
 }

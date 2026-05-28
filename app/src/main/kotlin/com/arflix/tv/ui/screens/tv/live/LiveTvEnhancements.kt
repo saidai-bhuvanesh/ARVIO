@@ -108,6 +108,14 @@ fun providerMatches(channel: EnrichedChannel, providerId: String, config: IptvCo
     return channelPlaylistId(channel, knownIds) == providerId
 }
 
+fun providerMatcher(providerId: String, config: IptvConfig): (EnrichedChannel) -> Boolean {
+    if (providerId == "all") return { true }
+    val knownIds = config.playlists
+        .filter { it.enabled && it.id.isNotBlank() }
+        .mapTo(HashSet()) { it.id }
+    return { channel -> channelPlaylistId(channel, knownIds) == providerId }
+}
+
 private fun channelPlaylistId(channel: EnrichedChannel, knownIds: Set<String>): String? {
     val prefix = channel.id.substringBefore(':', missingDelimiterValue = "")
     return prefix.takeIf { it in knownIds }
