@@ -77,6 +77,10 @@ fun EpgGrid(
     channels: List<EnrichedChannel>,
     clockTickMillis: Long,
     nowNext: Map<String, IptvNowNext>,
+    epgLoadingChannelIds: Set<String> = emptySet(),
+    epgAttemptedChannelIds: Set<String> = emptySet(),
+    isGuideBackfillLoading: Boolean = false,
+    hasGuideSource: Boolean = true,
     selectedChannelId: String?,
     focusSelectedChannelSignal: Int,
     focusEpgSignal: Int = 0,
@@ -428,9 +432,21 @@ fun EpgGrid(
                                 ) {
                                     programsInWindow(nowNext[ch.id], windowStartMillis, windowEndMillis)
                                 }
+                                val isGuideLoading = hasGuideSource &&
+                                    rowPrograms.isEmpty() &&
+                                    (
+                                        ch.id in epgLoadingChannelIds ||
+                                            isGuideBackfillLoading
+                                        )
+                                val placeholderTitle = when {
+                                    isGuideLoading -> "Loading guide..."
+                                    hasGuideSource -> "No Information"
+                                    else -> "No guide source"
+                                }
                                 ProgramsRow(
                                     channel = ch,
                                     programs = rowPrograms,
+                                    placeholderTitle = placeholderTitle,
                                     clockTickMillis = clockTickMillis,
                                     windowStartMillis = windowStartMillis,
                                     windowEndMillis = windowEndMillis,
@@ -500,6 +516,7 @@ fun EpgGrid(
 private fun ProgramsRow(
     channel: EnrichedChannel,
     programs: List<IptvProgram>,
+    placeholderTitle: String,
     clockTickMillis: Long,
     windowStartMillis: Long,
     windowEndMillis: Long,
@@ -531,8 +548,8 @@ private fun ProgramsRow(
                 }
             ),
     ) {
-        val placements = remember(programs, windowStartMillis, windowEndMillis, nowMillis) {
-            buildProgramPlacements(programs, windowStartMillis, windowEndMillis, nowMillis)
+        val placements = remember(programs, placeholderTitle, windowStartMillis, windowEndMillis, nowMillis) {
+            buildProgramPlacements(programs, windowStartMillis, windowEndMillis, nowMillis, placeholderTitle)
         }
         val focusablePlacementIndices = remember(placements, channel.catchupDays, nowMillis, epgMode) {
             if (!epgMode) return@remember emptyList()
@@ -733,7 +750,8 @@ private fun buildProgramPlacements(
     programs: List<IptvProgram>,
     windowStartMillis: Long,
     windowEndMillis: Long,
-    nowMillis: Long
+    nowMillis: Long,
+    placeholderTitle: String = "No Information",
 ): List<ProgramPlacement> {
     val placements = mutableListOf<ProgramPlacement>()
     var cursor = windowStartMillis
@@ -748,7 +766,7 @@ private fun buildProgramPlacements(
                 while (placeholderStart < gapEnd) {
                     val blockEnd = minOf(placeholderStart + 60 * 60_000L, gapEnd)
                     placements += ProgramPlacement(
-                        program = IptvProgram("No Information", startUtcMillis = placeholderStart, endUtcMillis = blockEnd),
+                        program = IptvProgram(placeholderTitle, startUtcMillis = placeholderStart, endUtcMillis = blockEnd),
                         startMin = ((placeholderStart - windowStartMillis) / 60_000L).toInt(),
                         durationMin = ((blockEnd - placeholderStart) / 60_000L).toInt().coerceAtLeast(1),
                         isNow = nowMillis in placeholderStart until blockEnd,
@@ -785,7 +803,7 @@ private fun buildProgramPlacements(
         while (placeholderStart < windowEndMillis) {
             val blockEnd = minOf(placeholderStart + 60 * 60_000L, windowEndMillis)
             placements += ProgramPlacement(
-                program = IptvProgram("No Information", startUtcMillis = placeholderStart, endUtcMillis = blockEnd),
+                program = IptvProgram(placeholderTitle, startUtcMillis = placeholderStart, endUtcMillis = blockEnd),
                 startMin = ((placeholderStart - windowStartMillis) / 60_000L).toInt(),
                 durationMin = ((blockEnd - placeholderStart) / 60_000L).toInt().coerceAtLeast(1),
                 isNow = nowMillis in placeholderStart until blockEnd,

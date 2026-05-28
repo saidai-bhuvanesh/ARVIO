@@ -24,6 +24,8 @@ import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
 internal const val FAVORITES_GROUP_NAME = "My Favorites"
+private const val EpgLoadingStateLimit = 800
+private const val EpgAttemptedStateLimit = 2_400
 
 data class TvUiState(
     val isLoading: Boolean = false,
@@ -39,12 +41,17 @@ data class TvUiState(
     val iptvPreferencesLoaded: Boolean = false,
     val tvSessionLoaded: Boolean = false,
     val favoritesOnly: Boolean = false,
-    val query: String = ""
+    val query: String = "",
+    val epgLoadingChannelIds: Set<String> = emptySet(),
+    val epgAttemptedChannelIds: Set<String> = emptySet(),
+    val epgBackfillInProgress: Boolean = false,
 ) {
     val isConfigured: Boolean get() =
         config.m3uUrl.isNotBlank() ||
             config.stalkerPortalUrl.isNotBlank() ||
             config.playlists.any { it.enabled && it.m3uUrl.isNotBlank() }
+
+    val hasPotentialGuideSource: Boolean get() = config.hasConfiguredEpgSource()
 }
 
 @HiltViewModel
@@ -66,6 +73,9 @@ class TvViewModel @Inject constructor(
     private var visibleEpgRefreshJob: Job? = null
     private var lastVisibleEpgRefreshKey: String? = null
     private var lastVisibleEpgRefreshAt: Long = 0L
+    private val visibleEpgQueueLock = Any()
+    private val pendingVisibleEpgChannelIds = LinkedHashSet<String>()
+    private var pendingVisibleEpgSelectedChannelId: String? = null
     private var tvSessionSaveJob: Job? = null
     private var startupGuideWarmupKey: String? = null
     private var fullEpgWarmupJob: Job? = null
@@ -409,13 +419,51 @@ class TvViewModel @Inject constructor(
     private fun mergeNowNext(updated: Map<String, com.arflix.tv.data.model.IptvNowNext>) {
         if (updated.isEmpty()) return
         val current = _uiState.value
+        val updatedIds = updated.keys
         setUiState(
             current.copy(
                 snapshot = current.snapshot.copy(
                     nowNext = current.snapshot.nowNext.toMutableMap().apply { putAll(updated) }
-                )
+                ),
+                epgLoadingChannelIds = current.epgLoadingChannelIds - updatedIds,
+                epgAttemptedChannelIds = capChannelStateSet(current.epgAttemptedChannelIds + updatedIds, EpgAttemptedStateLimit),
             )
         )
+    }
+
+    private fun markEpgLoading(channelIds: Collection<String>) {
+        val ids = channelIds.asSequence().filter { it.isNotBlank() }.take(EpgLoadingStateLimit).toSet()
+        if (ids.isEmpty()) return
+        val current = _uiState.value
+        setUiState(
+            current.copy(
+                epgLoadingChannelIds = capChannelStateSet(current.epgLoadingChannelIds + ids, EpgLoadingStateLimit),
+                epgAttemptedChannelIds = current.epgAttemptedChannelIds - ids,
+            )
+        )
+    }
+
+    private fun finishEpgAttempt(channelIds: Collection<String>) {
+        val ids = channelIds.asSequence().filter { it.isNotBlank() }.toSet()
+        if (ids.isEmpty()) return
+        val current = _uiState.value
+        setUiState(
+            current.copy(
+                epgLoadingChannelIds = current.epgLoadingChannelIds - ids,
+                epgAttemptedChannelIds = capChannelStateSet(current.epgAttemptedChannelIds + ids, EpgAttemptedStateLimit),
+            )
+        )
+    }
+
+    private fun capChannelStateSet(ids: Set<String>, limit: Int): Set<String> {
+        if (ids.size <= limit) return ids
+        return ids.toList().takeLast(limit).toSet()
+    }
+
+    private fun setEpgBackfillInProgress(inProgress: Boolean) {
+        val current = _uiState.value
+        if (current.epgBackfillInProgress == inProgress) return
+        setUiState(current.copy(epgBackfillInProgress = inProgress))
     }
 
     private fun epgCoverageRatio(snapshot: IptvSnapshot): Float {
@@ -524,6 +572,7 @@ class TvViewModel @Inject constructor(
         if (!force && backfillKey == lastCompleteEpgBackfillKey) return
         lastCompleteEpgBackfillKey = backfillKey
 
+        setEpgBackfillInProgress(true)
         completeEpgBackfillJob = viewModelScope.launch(Dispatchers.IO) {
             delay(if (channels.size > 10_000) 5_000L else 2_000L)
             val backfillResult = runCatching {
@@ -586,7 +635,12 @@ class TvViewModel @Inject constructor(
                     hiddenGroups = current.snapshot.hiddenGroups,
                     groupOrder = current.snapshot.groupOrder,
                 )
-                setUiState(current.copy(snapshot = mergedSnapshot))
+                setUiState(
+                    current.copy(
+                        snapshot = mergedSnapshot,
+                        epgLoadingChannelIds = emptySet(),
+                    )
+                )
                 val finalCoveragePct = (epgCoverageRatio(mergedSnapshot) * 100).toInt()
                 System.err.println("[EPG-Complete] merged full guide coverage=$finalCoveragePct%")
                 if (finalCoveragePct < 80) {
@@ -601,6 +655,9 @@ class TvViewModel @Inject constructor(
             job.invokeOnCompletion {
                 if (completeEpgBackfillJob === job) {
                     completeEpgBackfillJob = null
+                    viewModelScope.launch {
+                        setEpgBackfillInProgress(false)
+                    }
                 }
             }
         }
@@ -673,62 +730,71 @@ class TvViewModel @Inject constructor(
 
         lastVisibleEpgRefreshKey = refreshKey
         lastVisibleEpgRefreshAt = now
-        visibleEpgRefreshJob?.cancel()
+        val requestLimit = maxOf(firstPaintLimit, eagerLimit, backgroundLimit).coerceAtMost(orderedIds.size)
+        val missingIds = orderedIds
+            .filterNot { id -> hasProgramData(_uiState.value.snapshot.nowNext[id]) }
+            .take(requestLimit)
+        if (missingIds.isEmpty()) return
+
+        markEpgLoading(missingIds)
+        enqueueVisibleEpgRefresh(missingIds, selectedChannelId)
+    }
+
+    private fun enqueueVisibleEpgRefresh(channelIds: List<String>, selectedChannelId: String?) {
+        synchronized(visibleEpgQueueLock) {
+            selectedChannelId?.takeIf { it in channelIds }?.let { pendingVisibleEpgSelectedChannelId = it }
+            channelIds.forEach { id ->
+                if (id.isNotBlank()) {
+                    pendingVisibleEpgChannelIds.add(id)
+                }
+            }
+        }
+        startVisibleEpgDrain()
+    }
+
+    private fun startVisibleEpgDrain() {
+        if (visibleEpgRefreshJob?.isActive == true) return
         visibleEpgRefreshJob = viewModelScope.launch {
-            val cacheLimit = maxOf(firstPaintLimit, eagerLimit, backgroundLimit).coerceAtMost(orderedIds.size)
-            refreshGuideFromCache(orderedIds.take(cacheLimit).toCollection(LinkedHashSet()))
+            delay(120L)
+            var pass = 0
+            while (true) {
+                val batch = drainVisibleEpgBatch(maxChannels = if (pass == 0) 48 else 96)
+                if (batch.isEmpty()) break
 
-            val firstPaintIds = orderedIds
-                .filterNot { id -> hasProgramData(_uiState.value.snapshot.nowNext[id]) }
-                .take(minOf(firstPaintLimit, eagerLimit.coerceAtLeast(1)))
-            val firstPaintIdSet = firstPaintIds.toHashSet()
-            if (firstPaintIds.isNotEmpty()) {
-                System.err.println("[EPG-Category] firstPaint=${firstPaintIds.size} totalVisible=${orderedIds.size} selected=${selectedChannelId.orEmpty()}")
-                val firstPaintRefreshed = runCatching {
-                    iptvRepository.refreshEpgForChannels(
-                        firstPaintIds.toSet(),
-                        maxChannels = firstPaintIds.size
+                val batchSet = batch.toCollection(LinkedHashSet())
+                markEpgLoading(batchSet)
+                runCatching {
+                    refreshGuideFromCache(batchSet)
+
+                    val missingIds = batch
+                        .filterNot { id -> hasProgramData(_uiState.value.snapshot.nowNext[id]) }
+                    if (missingIds.isNotEmpty()) {
+                        System.err.println("[EPG-Category] queued=${missingIds.size} pass=$pass selected=${pendingVisibleEpgSelectedChannelId.orEmpty()}")
+                        val refreshed = withContext(Dispatchers.IO) {
+                            runCatching {
+                                iptvRepository.refreshEpgForChannels(
+                                    missingIds.toSet(),
+                                    maxChannels = missingIds.size
+                                )
+                            }.getOrNull()
+                        }
+                        if (!refreshed.isNullOrEmpty()) {
+                            mergeNowNext(refreshed)
+                        }
+                    }
+                }.onFailure { error ->
+                    AppLogger.recordException(
+                        throwable = error,
+                        context = mapOf(
+                            "error_area" to "IPTV",
+                            "iptv_phase" to "visible_epg_prefetch",
+                            "channel_count" to batch.size.toString()
+                        )
                     )
-                }.getOrNull()
-                if (!firstPaintRefreshed.isNullOrEmpty()) {
-                    mergeNowNext(firstPaintRefreshed)
                 }
-            }
-
-            val eagerIds = orderedIds
-                .filterNot { id -> id in firstPaintIdSet || hasProgramData(_uiState.value.snapshot.nowNext[id]) }
-                .take((eagerLimit - firstPaintIds.size).coerceAtLeast(0))
-            val eagerIdSet = eagerIds.toHashSet()
-            if (eagerIds.isNotEmpty()) {
-                System.err.println("[EPG-Category] eager=${eagerIds.size} totalVisible=${orderedIds.size} selected=${selectedChannelId.orEmpty()}")
-                val eagerRefreshed = runCatching {
-                    iptvRepository.refreshEpgForChannels(
-                        eagerIds.toSet(),
-                        maxChannels = eagerIds.size
-                    )
-                }.getOrNull()
-                if (!eagerRefreshed.isNullOrEmpty()) {
-                    mergeNowNext(eagerRefreshed)
-                }
-            }
-
-            val backgroundIds = orderedIds
-                .let { ids -> if (backgroundLimit > 0) ids.take(backgroundLimit) else ids }
-                .filterNot { id ->
-                    id in firstPaintIdSet || id in eagerIdSet || hasProgramData(_uiState.value.snapshot.nowNext[id])
-                }
-            if (backgroundIds.isEmpty()) return@launch
-
-            System.err.println("[EPG-Category] background=${backgroundIds.size} selected=${selectedChannelId.orEmpty()}")
-            val backgroundRefreshed = runCatching {
-                iptvRepository.refreshEpgForChannels(
-                    backgroundIds.toSet(),
-                    maxChannels = backgroundIds.size
-                )
-            }.getOrNull()
-
-            if (!backgroundRefreshed.isNullOrEmpty()) {
-                mergeNowNext(backgroundRefreshed)
+                finishEpgAttempt(batchSet)
+                pass += 1
+                delay(60L)
             }
         }.also { job ->
             job.invokeOnCompletion {
@@ -736,6 +802,37 @@ class TvViewModel @Inject constructor(
                     visibleEpgRefreshJob = null
                 }
             }
+        }
+    }
+
+    private fun drainVisibleEpgBatch(maxChannels: Int): List<String> {
+        if (maxChannels <= 0) return emptyList()
+        val currentNowNext = _uiState.value.snapshot.nowNext
+        return synchronized(visibleEpgQueueLock) {
+            if (pendingVisibleEpgChannelIds.isEmpty()) return@synchronized emptyList()
+            val batch = ArrayList<String>(maxChannels)
+
+            fun takePending(id: String?) {
+                if (id.isNullOrBlank() || batch.size >= maxChannels) return
+                if (pendingVisibleEpgChannelIds.remove(id) && !hasProgramData(currentNowNext[id])) {
+                    batch += id
+                }
+            }
+
+            takePending(pendingVisibleEpgSelectedChannelId)
+            val iterator = pendingVisibleEpgChannelIds.iterator()
+            while (iterator.hasNext() && batch.size < maxChannels) {
+                val id = iterator.next()
+                iterator.remove()
+                if (!hasProgramData(currentNowNext[id])) {
+                    batch += id
+                }
+            }
+            val selectedId = pendingVisibleEpgSelectedChannelId
+            if (selectedId == null || selectedId !in pendingVisibleEpgChannelIds) {
+                pendingVisibleEpgSelectedChannelId = null
+            }
+            batch
         }
     }
 
@@ -1068,22 +1165,41 @@ private fun filterTvChannels(
 }
 
 private fun hasNetworkEpgSource(config: IptvConfig): Boolean {
-    fun looksLikeXtream(url: String): Boolean {
-        return url.contains("player_api.php", ignoreCase = true) ||
-            url.contains("get.php", ignoreCase = true) ||
-            url.contains("xmltv.php", ignoreCase = true)
-    }
     return config.epgUrl.isNotBlank() ||
+        config.stalkerPortalUrl.isNotBlank() ||
         config.m3uUrl.isNotBlank() ||
         looksLikeXtream(config.m3uUrl) ||
         config.playlists.any { playlist ->
             playlist.enabled && (
                 playlist.epgUrl.isNotBlank() ||
+                    playlist.epgUrls.any { it.isNotBlank() } ||
                     playlist.m3uUrl.isNotBlank() ||
                     looksLikeXtream(playlist.m3uUrl) ||
                     looksLikeXtream(playlist.epgUrl)
                 )
         }
+}
+
+private fun IptvConfig.hasConfiguredEpgSource(): Boolean {
+    return epgUrl.isNotBlank() ||
+        stalkerPortalUrl.isNotBlank() ||
+        m3uUrl.isNotBlank() ||
+        looksLikeXtream(m3uUrl) ||
+        playlists.any { playlist ->
+            playlist.enabled && (
+                playlist.epgUrl.isNotBlank() ||
+                    playlist.epgUrls.any { it.isNotBlank() } ||
+                    playlist.m3uUrl.isNotBlank() ||
+                    looksLikeXtream(playlist.m3uUrl) ||
+                    looksLikeXtream(playlist.epgUrl)
+                )
+        }
+}
+
+private fun looksLikeXtream(url: String): Boolean {
+    return url.contains("player_api.php", ignoreCase = true) ||
+        url.contains("get.php", ignoreCase = true) ||
+        url.contains("xmltv.php", ignoreCase = true)
 }
 
 private fun IptvConfig.syncSignature(): String {
@@ -1095,6 +1211,7 @@ private fun IptvConfig.syncSignature(): String {
                 playlist.name,
                 playlist.m3uUrl,
                 playlist.epgUrl,
+                playlist.epgUrls.joinToString(","),
                 playlist.enabled.toString()
             ).joinToString("~")
         }

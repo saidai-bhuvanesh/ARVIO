@@ -314,25 +314,44 @@ fun LiveTvScreen(
         }
     }
 
-    val epgPrefetchIds = remember(filteredChannels, selectedCategoryId, playingChannelId) {
+    val epgAnchorChannelId = focusedChannelId ?: playingChannelId
+    val epgPrefetchIds = remember(filteredChannels, selectedCategoryId, epgAnchorChannelId) {
         val maxPrefetch = if (selectedCategoryId == "all") 96 else 180
+        val anchorIndex = epgAnchorChannelId
+            ?.let { id -> filteredChannels.indexOfFirst { channel -> channel.id == id } }
+            ?.takeIf { it >= 0 }
+            ?: 0
         buildList<String> {
-            playingChannelId
-                ?.takeIf { current -> filteredChannels.any { channel -> channel.id == current } }
-                ?.let { add(it) }
+            filteredChannels.getOrNull(anchorIndex)?.id?.let { add(it) }
+            filteredChannels
+                .asSequence()
+                .drop(anchorIndex + 1)
+                .map { it.id }
+                .take((maxPrefetch - size).coerceAtLeast(0))
+                .forEach { add(it) }
+            filteredChannels
+                .asSequence()
+                .take(anchorIndex)
+                .toList()
+                .asReversed()
+                .asSequence()
+                .map { it.id }
+                .take(minOf(24, (maxPrefetch - size).coerceAtLeast(0)))
+                .forEach { add(it) }
             filteredChannels
                 .asSequence()
                 .map { it.id }
-                .filterNot { it == playingChannelId }
+                .filterNot { it == epgAnchorChannelId }
+                .filterNot { contains(it) }
                 .take((maxPrefetch - size).coerceAtLeast(0))
                 .forEach { add(it) }
         }
     }
-    LaunchedEffect(selectedCategoryId, epgPrefetchIds, playingChannelId) {
+    LaunchedEffect(selectedCategoryId, epgPrefetchIds, epgAnchorChannelId) {
         if (epgPrefetchIds.isNotEmpty()) {
             viewModel.prefetchVisibleCategoryEpg(
                 channelIds = epgPrefetchIds,
-                selectedChannelId = playingChannelId,
+                selectedChannelId = epgAnchorChannelId,
                 eagerLimit = if (selectedCategoryId == "all") 32 else 64,
                 backgroundLimit = if (selectedCategoryId == "all") 120 else 240,
             )
@@ -722,6 +741,10 @@ fun LiveTvScreen(
                         channels = filteredChannels,
                         clockTickMillis = guideClockMillis,
                         nowNext = state.snapshot.nowNext,
+                        epgLoadingChannelIds = state.epgLoadingChannelIds,
+                        epgAttemptedChannelIds = state.epgAttemptedChannelIds,
+                        isGuideBackfillLoading = state.epgBackfillInProgress,
+                        hasGuideSource = state.hasPotentialGuideSource,
                         selectedChannelId = focusedChannelId ?: playingChannelId,
                         focusSelectedChannelSignal = focusSelectedChannelSignal,
                         focusEpgSignal = focusEpgSignal,
@@ -820,6 +843,10 @@ fun LiveTvScreen(
                         channels = filteredChannels,
                         clockTickMillis = guideClockMillis,
                         nowNext = state.snapshot.nowNext,
+                        epgLoadingChannelIds = state.epgLoadingChannelIds,
+                        epgAttemptedChannelIds = state.epgAttemptedChannelIds,
+                        isGuideBackfillLoading = state.epgBackfillInProgress,
+                        hasGuideSource = state.hasPotentialGuideSource,
                         selectedChannelId = focusedChannelId ?: playingChannelId,
                         focusSelectedChannelSignal = focusSelectedChannelSignal,
                         focusEpgSignal = focusEpgSignal,
