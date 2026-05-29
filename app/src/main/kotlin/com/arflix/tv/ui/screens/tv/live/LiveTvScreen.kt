@@ -538,6 +538,7 @@ fun LiveTvScreen(
     var hudPokeSignal by remember { mutableStateOf(0) }
 
     fun openFullscreenGuide() {
+        viewModel.refreshCatchupHistoryForChannel(playingChannelId)
         fullscreenGuideTab = if (playingCatchupProgram != null) {
             FullscreenGuideTab.Past
         } else {

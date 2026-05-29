@@ -30,6 +30,8 @@ private const val EpgAttemptedStateLimit = 2_400
 private const val LargeIptvListChannelCount = 10_000
 private const val StandardPriorityEpgLimit = 3_200
 private const val LargeListPriorityCacheLimit = 360
+private const val RichCatchupRecentTarget = 6
+private const val RichCatchupRefreshThrottleMs = 45_000L
 
 data class TvUiState(
     val isLoading: Boolean = false,
@@ -91,6 +93,7 @@ class TvViewModel @Inject constructor(
     private var preparedContentJob: Job? = null
     private var preparedContentRevision: Long = 0L
     private val resolvedStalkerStreamCache = LinkedHashMap<String, String>()
+    private val catchupHistoryRefreshAt = LinkedHashMap<String, Long>()
 
     /**
      * In-memory cache of the live-TV enriched channel list + category tree.
@@ -825,6 +828,43 @@ class TvViewModel @Inject constructor(
 
         markEpgLoading(missingIds)
         enqueueVisibleEpgRefresh(missingIds, selectedChannelId)
+    }
+
+    fun refreshCatchupHistoryForChannel(channelId: String?) {
+        val id = channelId?.trim().orEmpty()
+        if (id.isBlank()) return
+        val now = System.currentTimeMillis()
+        val current = _uiState.value
+        val recentCount = current.snapshot.nowNext[id]?.recent
+            .orEmpty()
+            .count { it.endUtcMillis <= now && it.endUtcMillis >= now - 48L * 60L * 60_000L }
+        if (recentCount >= RichCatchupRecentTarget) return
+        val lastRefreshAt = catchupHistoryRefreshAt[id] ?: 0L
+        if (now - lastRefreshAt < RichCatchupRefreshThrottleMs) return
+
+        catchupHistoryRefreshAt[id] = now
+        while (catchupHistoryRefreshAt.size > 120) {
+            val firstKey = catchupHistoryRefreshAt.keys.firstOrNull() ?: break
+            catchupHistoryRefreshAt.remove(firstKey)
+        }
+
+        markEpgLoading(setOf(id))
+        viewModelScope.launch {
+            val refreshed = withContext(Dispatchers.IO) {
+                runCatching {
+                    iptvRepository.refreshEpgForChannels(
+                        channelIds = setOf(id),
+                        maxChannels = 1,
+                        preferFullCatchupHistory = true
+                    )
+                }.getOrNull()
+            }
+            if (!refreshed.isNullOrEmpty()) {
+                mergeNowNext(refreshed)
+            } else {
+                finishEpgAttempt(setOf(id))
+            }
+        }
     }
 
     private fun enqueueVisibleEpgRefresh(channelIds: List<String>, selectedChannelId: String?) {

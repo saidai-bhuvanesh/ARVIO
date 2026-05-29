@@ -14,6 +14,7 @@ import com.arflix.tv.data.model.StreamSource
 import com.arflix.tv.util.settingsDataStore
 import com.google.gson.Gson
 import com.google.gson.JsonArray
+import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.google.gson.annotations.SerializedName
 import com.google.gson.reflect.TypeToken
@@ -244,6 +245,7 @@ class IptvRepository @Inject constructor(
     private val completeEpgCoverageTarget = 0.98f
     private val xtreamShortEpgLimit = 8
     private val startupShortEpgChannelLimit = 1200
+    private val fullCatchupHistoryChannelLimit = 4
     private val xtreamShortEpgBatchSize = 512
     private val xtreamShortEpgConcurrency = 32
     private val cacheUpcomingProgramLimit = 24
@@ -1827,7 +1829,8 @@ class IptvRepository @Inject constructor(
      */
     suspend fun refreshEpgForChannels(
         channelIds: Set<String>,
-        maxChannels: Int = startupShortEpgChannelLimit
+        maxChannels: Int = startupShortEpgChannelLimit,
+        preferFullCatchupHistory: Boolean = false
     ): Map<String, IptvNowNext>? {
         if (channelIds.isEmpty()) return null
         return withContext(Dispatchers.IO) {
@@ -1880,16 +1883,35 @@ class IptvRepository @Inject constructor(
 
                 val streamIds = providerChannels.mapNotNull { resolveXtreamStreamId(it) }
                 var errors = 0
-                val allListings = fetchXtreamEpgListingsAsync(
-                    creds = creds,
-                    streamIds = streamIds,
-                    timeoutMillis = xtreamShortEpgTimeout(streamIds.size)
-                ) { _, hadError ->
-                    if (hadError) errors++
+                val shouldUseFullCatchupHistory = preferFullCatchupHistory &&
+                    providerChannels.size <= fullCatchupHistoryChannelLimit &&
+                    providerChannels.any { effectiveCatchupDays(it) > 0 }
+                val fullListings = if (shouldUseFullCatchupHistory) {
+                    fetchXtreamFullEpgListingsAsync(
+                        creds = creds,
+                        streamIds = streamIds,
+                        timeoutMillis = xtreamFullCatchupEpgTimeout(streamIds.size)
+                    ) { _, hadError ->
+                        if (hadError) errors++
+                    }
+                } else {
+                    emptyList()
+                }
+                val allListings = fullListings.ifEmpty {
+                    fetchXtreamEpgListingsAsync(
+                        creds = creds,
+                        streamIds = streamIds,
+                        timeoutMillis = xtreamShortEpgTimeout(streamIds.size)
+                    ) { _, hadError ->
+                        if (hadError) errors++
+                    }
                 }
                 totalListings += allListings.size
                 totalErrors += errors
-                System.err.println("[EPG-Refresh] Provider done: ${allListings.size} listings, $errors errors")
+                System.err.println(
+                    "[EPG-Refresh] Provider done: ${allListings.size} listings, $errors errors " +
+                        "fullCatchup=$shouldUseFullCatchupHistory"
+                )
 
                 if (allListings.isEmpty()) return@forEach
 
@@ -4674,7 +4696,7 @@ class IptvRepository @Inject constructor(
                             if (continuation.isActive) continuation.resume(result)
                         }
                     } catch (error: Throwable) {
-                        System.err.println("IptvRepository: JSON request failed for ${url.take(120)}: ${error.message}")
+                        System.err.println("IptvRepository: JSON request failed for ${redactIptvUrl(url)}: ${error.message}")
                         if (continuation.isActive) continuation.resume(null)
                     }
                 }
@@ -4826,6 +4848,21 @@ class IptvRepository @Inject constructor(
     private data class XtreamEpgResponse(
         @SerializedName("epg_listings") val epgListings: List<XtreamEpgListing>? = null
     )
+
+    private fun parseXtreamListingsFromJson(response: JsonObject?): List<XtreamEpgListing> {
+        val listingsElement = response?.get("epg_listings") ?: return emptyList()
+        return when {
+            listingsElement.isJsonArray -> listingsElement.asJsonArray.mapNotNull { it.toXtreamEpgListingOrNull() }
+            listingsElement.isJsonObject -> listingsElement.asJsonObject.entrySet()
+                .asSequence()
+                .mapNotNull { it.value.toXtreamEpgListingOrNull() }
+                .toList()
+            else -> emptyList()
+        }
+    }
+
+    private fun JsonElement.toXtreamEpgListingOrNull(): XtreamEpgListing? =
+        runCatching { gson.fromJson(this, XtreamEpgListing::class.java) }.getOrNull()
 
     /**
      * Decode a base64-encoded string from the Xtream short EPG API.
@@ -5049,6 +5086,53 @@ class IptvRepository @Inject constructor(
         return listingsResult.toList()
     }
 
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private suspend fun fetchXtreamFullEpgListingsAsync(
+        creds: XtreamCredentials,
+        streamIds: List<Int>,
+        timeoutMillis: Long = 16_000L,
+        onStreamProcessed: (Int, Boolean) -> Unit = { _, _ -> }
+    ): List<XtreamEpgListing> {
+        val distinctStreamIds = streamIds.distinct()
+        if (distinctStreamIds.isEmpty()) return emptyList()
+        val gate = Semaphore(4)
+        val listingsResult = ConcurrentLinkedQueue<XtreamEpgListing>()
+        val completed = withTimeoutOrNull(timeoutMillis) {
+            withContext(Dispatchers.IO.limitedParallelism(4)) {
+                distinctStreamIds.map { sid ->
+                    async {
+                        gate.withPermit {
+                            var hadError = false
+                            val url = "${creds.baseUrl}/player_api.php?username=${creds.username}" +
+                                "&password=${creds.password}&action=get_simple_data_table&stream_id=$sid"
+                            try {
+                                val resp: JsonObject? = requestJson(
+                                    url = url,
+                                    type = JsonObject::class.java,
+                                    client = xtreamGuideHttpClient
+                                )
+                                val listings = parseXtreamListingsFromJson(resp)
+                                if (listings.isNotEmpty()) {
+                                    listingsResult.addAll(listings)
+                                }
+                            } catch (_: Exception) {
+                                hadError = true
+                            }
+                            onStreamProcessed(sid, hadError)
+                        }
+                    }
+                }.awaitAll()
+            }
+        }
+        if (completed == null) {
+            System.err.println(
+                "[EPG] Xtream full catchup EPG timed out after ${timeoutMillis}ms; " +
+                    "keeping ${listingsResult.size} fetched listings"
+            )
+        }
+        return listingsResult.toList()
+    }
+
     private fun xtreamShortEpgTimeout(streamCount: Int): Long =
         when {
             streamCount > 25_000 -> 1_200_000L
@@ -5059,6 +5143,13 @@ class IptvRepository @Inject constructor(
             streamCount > 64 -> 18_000L
             streamCount > 16 -> 12_000L
             else -> 6_000L
+        }
+
+    private fun xtreamFullCatchupEpgTimeout(streamCount: Int): Long =
+        when {
+            streamCount > 2 -> 24_000L
+            streamCount > 1 -> 16_000L
+            else -> 10_000L
         }
 
     /**
