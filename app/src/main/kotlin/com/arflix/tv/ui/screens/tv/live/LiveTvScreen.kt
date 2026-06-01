@@ -422,6 +422,7 @@ fun LiveTvScreen(
     var playingChannelId by rememberSaveable { mutableStateOf<String?>(initialChannelId) }
     var focusedChannelId by rememberSaveable { mutableStateOf<String?>(initialChannelId) }
     var epgPrefetchAnchorId by rememberSaveable { mutableStateOf<String?>(initialChannelId) }
+    var startupChannelApplied by rememberSaveable(selectedProviderId) { mutableStateOf(false) }
     var playingCatchupProgram by remember { mutableStateOf<IptvProgram?>(null) }
     val focusCommitScope = rememberCoroutineScope()
     val pendingFocusCommit = remember { arrayOf<Pair<String, String>?>(null) }
@@ -533,13 +534,37 @@ fun LiveTvScreen(
             }
         }
     }
-    LaunchedEffect(selectedCategoryId, epgPrefetchIds, epgAnchorChannelId) {
-        if (epgPrefetchIds.isNotEmpty()) {
+    LaunchedEffect(selectedCategoryId, epgPrefetchIds, epgAnchorChannelId, state.iptvPreferencesLoaded, state.tvSessionLoaded, state.tvSession.lastChannelId, guideChannelIndexById, startupChannelApplied, playingChannelId, selectedDisplayChannelId, focusedChannelId) {
+        val startupReady = state.iptvPreferencesLoaded && state.tvSessionLoaded
+        val sessionAnchorId = state.tvSession.lastChannelId
+            .takeIf { it.isNotBlank() && it in filteredChannelIndexById }
+        val sessionAnchorVisible = sessionAnchorId == null || sessionAnchorId in guideChannelIndexById
+        val prefetchAnchorVisible = epgAnchorChannelId == null || epgAnchorChannelId in guideChannelIndexById
+        val currentAnchorVisible = listOfNotNull(playingChannelId, selectedDisplayChannelId, focusedChannelId)
+            .any { it in guideChannelIndexById }
+        if (startupReady && startupChannelApplied && currentAnchorVisible && sessionAnchorVisible && prefetchAnchorVisible && epgPrefetchIds.isNotEmpty()) {
             viewModel.prefetchVisibleCategoryEpg(
                 channelIds = epgPrefetchIds,
                 selectedChannelId = epgAnchorChannelId,
                 eagerLimit = if (selectedCategoryId == "all") 32 else 64,
                 backgroundLimit = if (selectedCategoryId == "all") 120 else 240,
+            )
+        }
+    }
+    LaunchedEffect(playingChannelId, selectedDisplayChannelId, focusedChannelId, state.iptvPreferencesLoaded, state.tvSessionLoaded, startupChannelApplied) {
+        val ids = listOfNotNull(playingChannelId, selectedDisplayChannelId, focusedChannelId)
+            .filter { it.isNotBlank() }
+            .distinct()
+        val selectedId = playingChannelId ?: selectedDisplayChannelId ?: focusedChannelId
+        if (ids.isEmpty() || selectedId.isNullOrBlank()) return@LaunchedEffect
+        if (state.iptvPreferencesLoaded && state.tvSessionLoaded && startupChannelApplied) {
+            System.err.println("[EPG-Current] ids=${ids.take(4)} selected=$selectedId")
+            viewModel.refreshCurrentChannelEpg(selectedId)
+            viewModel.prefetchVisibleCategoryEpg(
+                channelIds = ids,
+                selectedChannelId = selectedId,
+                eagerLimit = 1,
+                backgroundLimit = 1,
             )
         }
     }
@@ -563,11 +588,11 @@ fun LiveTvScreen(
     // Pick the startup channel only after saved IPTV preferences/session have
     // loaded. Favorites win over a stale recent channel, then we fall back to
     // the persisted recent channel, then the first filtered entry.
-    LaunchedEffect(filteredChannels, filteredChannelIndexById, playingChannelId, initialChannelId, state.tvSession, state.snapshot.favoriteChannels, visibleEnrichedState.value.all.size, state.iptvPreferencesLoaded, state.tvSessionLoaded, selectedProviderId) {
+    LaunchedEffect(filteredChannels, filteredChannelIndexById, playingChannelId, initialChannelId, state.tvSession, state.snapshot.favoriteChannels, visibleEnrichedState.value.all.size, state.iptvPreferencesLoaded, state.tvSessionLoaded, selectedProviderId, startupChannelApplied) {
         val startupStateReady = state.iptvPreferencesLoaded && state.tvSessionLoaded
         val playingVisible = playingChannelId?.let { id -> id in visibleEnrichedState.value.index.byId } == true
-        if ((!playingVisible || playingChannelId == null) && filteredChannels.isNotEmpty() && (initialChannelId != null || startupStateReady)) {
-            playingChannelId = chooseStartupChannelId(
+        if (!startupChannelApplied && filteredChannels.isNotEmpty() && (initialChannelId != null || startupStateReady)) {
+            val startupChannelId = chooseStartupChannelId(
                 filteredChannels = filteredChannels,
                 filteredChannelIds = filteredChannelIndexById.keys,
                 explicitInitialChannelId = initialChannelId?.takeIf { selectedProviderId == "all" || it in visibleEnrichedState.value.index.byId },
@@ -576,6 +601,34 @@ fun LiveTvScreen(
                 favoriteChannelIds = state.snapshot.favoriteChannels,
                 isFullyEnriched = visibleEnrichedState.value.all.isNotEmpty(),
             )
+            if (startupChannelId != null) {
+                val displayId = displayChannelIdFor(startupChannelId, visibleEnrichedState.value.index.byId, variantGroups)
+                    ?: startupChannelId
+                playingChannelId = startupChannelId
+                focusedChannelId = displayId
+                epgPrefetchAnchorId = displayId
+                rememberedChannelByCategory[selectedCategoryId] = displayId
+                filteredChannelIndexById[displayId]
+                    ?.let { setGuideWindow(guideWindowAround(it, filteredChannels.size)) }
+                startupChannelApplied = true
+                System.err.println("[EPG-Startup] channel=$startupChannelId focus=$displayId")
+            }
+        } else if ((!playingVisible || playingChannelId == null) && filteredChannels.isNotEmpty() && startupStateReady) {
+            val fallbackChannelId = chooseStartupChannelId(
+                filteredChannels = filteredChannels,
+                filteredChannelIds = filteredChannelIndexById.keys,
+                explicitInitialChannelId = null,
+                sessionLastChannelId = state.tvSession.lastChannelId,
+                hasOpenedBefore = state.tvSession.lastOpenedAt > 0L,
+                favoriteChannelIds = state.snapshot.favoriteChannels,
+                isFullyEnriched = visibleEnrichedState.value.all.isNotEmpty(),
+            )
+            if (fallbackChannelId != null) {
+                playingChannelId = fallbackChannelId
+                focusedChannelId = displayChannelIdFor(fallbackChannelId, visibleEnrichedState.value.index.byId, variantGroups)
+                    ?: fallbackChannelId
+                epgPrefetchAnchorId = focusedChannelId
+            }
         }
         if (focusedChannelId == null || focusedChannelId !in filteredChannelIndexById) {
             focusedChannelId = displayChannelIdFor(playingChannelId, visibleEnrichedState.value.index.byId, variantGroups)
