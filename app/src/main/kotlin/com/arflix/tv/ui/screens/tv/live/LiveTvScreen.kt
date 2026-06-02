@@ -266,6 +266,12 @@ private fun IptvChannel.catchupInSegmentSeekOffset(offsetMs: Long): Long {
     return (safeOffset - catchupUrlAnchorOffset(safeOffset)).coerceAtLeast(0L)
 }
 
+private fun EnrichedChannel?.supportsCatchupHistory(): Boolean {
+    val source = this?.source ?: return false
+    if (source.catchupDays > 0) return true
+    return !source.catchupType.isNullOrBlank() || !source.catchupSource.isNullOrBlank()
+}
+
 @Composable
 fun LiveTvScreen(
     viewModel: TvViewModel = hiltViewModel(),
@@ -714,6 +720,22 @@ fun LiveTvScreen(
                 backgroundLimit = 1,
             )
         }
+    }
+    val catchupHistoryAnchorId = remember(
+        epgAnchorChannelId,
+        selectedDisplayChannelId,
+        focusedChannelId,
+        playingChannelId,
+        visibleChannelsById,
+    ) {
+        listOfNotNull(epgAnchorChannelId, selectedDisplayChannelId, focusedChannelId, playingChannelId)
+            .firstOrNull { id -> visibleChannelsById[id].supportsCatchupHistory() }
+    }
+    LaunchedEffect(catchupHistoryAnchorId, state.iptvPreferencesLoaded, state.tvSessionLoaded, startupChannelApplied) {
+        if (!state.iptvPreferencesLoaded || !state.tvSessionLoaded || !startupChannelApplied) return@LaunchedEffect
+        val id = catchupHistoryAnchorId ?: return@LaunchedEffect
+        delay(180L)
+        viewModel.refreshCatchupHistoryForChannel(id)
     }
     val guideStatusIds = remember(epgPrefetchIds, guideChannels, visibleChannelsById, effectiveGuideNowNext) {
         epgPrefetchIds
@@ -1935,7 +1957,7 @@ fun LiveTvScreen(
                 FullscreenGuideOverlay(
                     visible = isFullScreen && fullscreenGuideOpen,
                     channel = playingChannel,
-                    guide = playingChannelId?.let { state.snapshot.nowNext[it] },
+                    guide = guideForChannel(playingChannel),
                     selectedProgram = playingCatchupProgram,
                     isTouchDevice = isTouchDevice,
                     onDismiss = {

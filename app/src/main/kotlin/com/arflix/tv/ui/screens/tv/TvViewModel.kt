@@ -429,6 +429,30 @@ class TvViewModel @Inject constructor(
         return futureCount >= 6 || (hasLongEnoughCurrent && futureCount >= 3)
     }
 
+    private fun supportsCatchup(channel: IptvChannel?): Boolean {
+        if (channel == null) return false
+        if (channel.catchupDays > 0) return true
+        return !channel.catchupType.isNullOrBlank() || !channel.catchupSource.isNullOrBlank()
+    }
+
+    private fun recentCatchupCount(
+        item: com.arflix.tv.data.model.IptvNowNext?,
+        now: Long = System.currentTimeMillis()
+    ): Int {
+        return item?.recent
+            .orEmpty()
+            .count { it.endUtcMillis <= now && it.endUtcMillis >= now - 48L * 60L * 60_000L }
+    }
+
+    private fun hasRecentCatchupHistory(
+        channel: IptvChannel?,
+        item: com.arflix.tv.data.model.IptvNowNext?,
+        now: Long = System.currentTimeMillis()
+    ): Boolean {
+        if (!supportsCatchup(channel)) return true
+        return recentCatchupCount(item, now) >= RichCatchupRecentTarget
+    }
+
     private suspend fun refreshGuideFromCache() {
         val state = _uiState.value
         val channelIds = buildPriorityEpgChannelIds(
@@ -966,18 +990,22 @@ class TvViewModel @Inject constructor(
         markEpgLoading(setOf(id))
         viewModelScope.launch {
             refreshGuideFromCache(setOf(id))
-            val cachedGuide = _uiState.value.snapshot.nowNext[id]
-            if (hasRichSelectedGuideData(cachedGuide)) {
+            val afterCacheState = _uiState.value
+            val channel = afterCacheState.channelLookup[id]
+                ?: afterCacheState.snapshot.channels.firstOrNull { it.id == id }
+            val cachedGuide = afterCacheState.snapshot.nowNext[id]
+            val needsCatchupHistory = supportsCatchup(channel) && !hasRecentCatchupHistory(channel, cachedGuide)
+            if (hasRichSelectedGuideData(cachedGuide) && !needsCatchupHistory) {
                 clearEpgLoading(setOf(id))
                 return@launch
             }
-            System.err.println("[EPG-Current] refreshing channel=$id")
+            System.err.println("[EPG-Current] refreshing channel=$id fullCatchup=$needsCatchupHistory")
             val refreshed = withContext(Dispatchers.IO) {
                 runCatching {
                     iptvRepository.refreshEpgForChannels(
                         channelIds = setOf(id),
                         maxChannels = 1,
-                        preferFullCatchupHistory = false
+                        preferFullCatchupHistory = needsCatchupHistory
                     )
                 }.getOrNull()
             }
@@ -994,10 +1022,10 @@ class TvViewModel @Inject constructor(
         if (id.isBlank()) return
         val now = System.currentTimeMillis()
         val current = _uiState.value
-        val recentCount = current.snapshot.nowNext[id]?.recent
-            .orEmpty()
-            .count { it.endUtcMillis <= now && it.endUtcMillis >= now - 48L * 60L * 60_000L }
-        if (recentCount >= RichCatchupRecentTarget) return
+        val channel = current.channelLookup[id]
+            ?: current.snapshot.channels.firstOrNull { it.id == id }
+        if (!supportsCatchup(channel)) return
+        if (hasRecentCatchupHistory(channel, current.snapshot.nowNext[id], now)) return
         val lastRefreshAt = catchupHistoryRefreshAt[id] ?: 0L
         if (now - lastRefreshAt < RichCatchupRefreshThrottleMs) return
 
@@ -1009,6 +1037,14 @@ class TvViewModel @Inject constructor(
 
         markEpgLoading(setOf(id))
         viewModelScope.launch {
+            refreshGuideFromCache(setOf(id))
+            val afterCache = _uiState.value
+            val afterCacheChannel = afterCache.channelLookup[id]
+                ?: afterCache.snapshot.channels.firstOrNull { it.id == id }
+            if (hasRecentCatchupHistory(afterCacheChannel, afterCache.snapshot.nowNext[id])) {
+                clearEpgLoading(setOf(id))
+                return@launch
+            }
             val refreshed = withContext(Dispatchers.IO) {
                 runCatching {
                     iptvRepository.refreshEpgForChannels(
