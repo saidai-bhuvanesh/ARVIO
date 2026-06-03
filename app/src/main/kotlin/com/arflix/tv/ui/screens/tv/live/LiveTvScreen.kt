@@ -561,24 +561,9 @@ fun LiveTvScreen(
         }
     }
     val visibleChannelsById = visibleEnrichedState.value.index.byId
-    val guideByFallbackKey = remember(state.snapshot.nowNext, visibleChannelsById) {
-        HashMap<String, IptvNowNext>().apply {
-            state.snapshot.nowNext.forEach { (channelId, guide) ->
-                if (!guide.hasGuideData()) return@forEach
-                val channel = visibleChannelsById[channelId] ?: return@forEach
-                channel.guideFallbackKeys().forEach { key ->
-                    put(key, mergeGuideSlices(this[key], guide) ?: guide)
-                }
-            }
-        }
-    }
     fun guideForChannel(channel: EnrichedChannel?): IptvNowNext? {
         if (channel == null) return null
-        val direct = state.snapshot.nowNext[channel.id]
-        val fallback = channel.guideFallbackKeys()
-            .mapNotNull { key -> guideByFallbackKey[key] }
-            .fold<IptvNowNext, IptvNowNext?>(null) { merged, next -> mergeGuideSlices(merged, next) }
-        return mergeGuideSlices(direct, fallback)
+        return state.snapshot.nowNext[channel.id]
     }
     // Playing channel — default to the one we were navigated to, else the first
     // channel of the first non-empty category.
@@ -628,7 +613,7 @@ fun LiveTvScreen(
     val catchupInSegmentSeekMs = remember(playingChannel?.source, catchupPlaybackOffsetMs) {
         playingChannel?.source?.catchupInSegmentSeekOffset(catchupPlaybackOffsetMs) ?: 0L
     }
-    val currentNowNext = remember(playingChannel, playingCatchupProgram, state.snapshot.nowNext, guideByFallbackKey) {
+    val currentNowNext = remember(playingChannel, playingCatchupProgram, state.snapshot.nowNext) {
         val live = guideForChannel(playingChannel)
         val catchup = playingCatchupProgram
         if (catchup != null) {
@@ -706,15 +691,10 @@ fun LiveTvScreen(
             guideChannels.forEachIndexed { index, channel -> put(channel.id, index) }
         }
     }
-    val effectiveGuideNowNext = remember(state.snapshot.nowNext, guideChannels, guideByFallbackKey) {
-        HashMap<String, IptvNowNext>(state.snapshot.nowNext.size + guideChannels.size).apply {
-            putAll(state.snapshot.nowNext)
+    val effectiveGuideNowNext = remember(state.snapshot.nowNext, guideChannels) {
+        HashMap<String, IptvNowNext>(guideChannels.size).apply {
             guideChannels.forEach { channel ->
-                val direct = state.snapshot.nowNext[channel.id]
-                val fallback = channel.guideFallbackKeys()
-                    .mapNotNull { key -> guideByFallbackKey[key] }
-                    .fold<IptvNowNext, IptvNowNext?>(null) { merged, next -> mergeGuideSlices(merged, next) }
-                mergeGuideSlices(direct, fallback)?.let { put(channel.id, it) }
+                state.snapshot.nowNext[channel.id]?.let { put(channel.id, it) }
             }
         }
     }
