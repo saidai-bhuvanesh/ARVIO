@@ -40,6 +40,7 @@ private const val CatchupHistoryWindowMs = 48L * 60L * 60_000L
 private const val RichCatchupRefreshThrottleMs = 45_000L
 private const val CurrentChannelEpgRefreshThrottleMs = 12_000L
 private const val LargeListCompleteGuideCoverageTarget = 0.75f
+private const val PlaybackEpgBackfillResumeDelayMs = 90_000L
 
 data class TvUiState(
     val isLoading: Boolean = false,
@@ -98,6 +99,10 @@ class TvViewModel @Inject constructor(
     private var lastCompleteEpgBackfillKey: String? = null
     private var lastVisibleForcedCompleteEpgAt: Long = 0L
     private var lastCompleteEpgBackfillCompletedAt: Long = 0L
+    private var liveTvPlaybackActive: Boolean = false
+    private var deferredCompleteEpgBackfill: Boolean = false
+    private val deferredCompleteEpgPriorityIds = LinkedHashSet<String>()
+    private var deferredCompleteEpgBackfillJob: Job? = null
     private var preparedContentJob: Job? = null
     private var preparedContentRevision: Long = 0L
     private val resolvedStalkerStreamCache = LinkedHashMap<String, String>()
@@ -593,6 +598,56 @@ class TvViewModel @Inject constructor(
         setUiState(current.copy(epgBackfillInProgress = inProgress))
     }
 
+    fun setLiveTvPlaybackActive(active: Boolean) {
+        if (liveTvPlaybackActive == active) return
+        liveTvPlaybackActive = active
+        if (active) {
+            deferredCompleteEpgBackfillJob?.cancel()
+            deferredCompleteEpgBackfillJob = null
+            if (completeEpgBackfillJob?.isActive == true) {
+                deferredCompleteEpgBackfill = true
+                lastCompleteEpgBackfillKey = null
+                System.err.println("[EPG-Complete] Pausing full guide backfill because live playback started")
+                completeEpgBackfillJob?.cancel()
+                setEpgBackfillInProgress(false)
+            }
+        } else {
+            scheduleDeferredCompleteEpgBackfill()
+        }
+    }
+
+    private fun deferCompleteEpgBackfill(priorityChannelIds: Collection<String>) {
+        deferredCompleteEpgBackfill = true
+        priorityChannelIds
+            .asSequence()
+            .filter { it.isNotBlank() }
+            .take(StandardPriorityEpgLimit - deferredCompleteEpgPriorityIds.size)
+            .forEach(deferredCompleteEpgPriorityIds::add)
+        setEpgBackfillInProgress(false)
+        System.err.println("[EPG-Complete] Deferred full guide backfill while live playback is active")
+    }
+
+    private fun scheduleDeferredCompleteEpgBackfill() {
+        if (!deferredCompleteEpgBackfill) return
+        if (completeEpgBackfillJob?.isActive == true) return
+        deferredCompleteEpgBackfillJob?.cancel()
+        deferredCompleteEpgBackfillJob = viewModelScope.launch {
+            delay(PlaybackEpgBackfillResumeDelayMs)
+            if (liveTvPlaybackActive) return@launch
+            val priorityIds = deferredCompleteEpgPriorityIds.toList()
+            deferredCompleteEpgPriorityIds.clear()
+            deferredCompleteEpgBackfill = false
+            System.err.println("[EPG-Complete] Resuming deferred full guide backfill after playback idle")
+            startCompleteEpgBackfill(force = true, priorityChannelIds = priorityIds)
+        }.also { job ->
+            job.invokeOnCompletion {
+                if (deferredCompleteEpgBackfillJob === job) {
+                    deferredCompleteEpgBackfillJob = null
+                }
+            }
+        }
+    }
+
     private fun epgCoverageRatio(snapshot: IptvSnapshot): Float {
         if (snapshot.channels.isEmpty()) return 0f
         val covered = snapshot.channels.count { ch ->
@@ -716,6 +771,10 @@ class TvViewModel @Inject constructor(
         val largeList = isLargeIptvList(channels.size)
         if (!state.isConfigured || channels.isEmpty()) return
         if (!hasNetworkEpgSource(state.config)) return
+        if (liveTvPlaybackActive) {
+            deferCompleteEpgBackfill(priorityChannelIds)
+            return
+        }
         val indexedGuideChannels = if (largeList) {
             runCatching { iptvRepository.indexedGuideChannelCount() }.getOrDefault(0)
         } else {
@@ -792,7 +851,11 @@ class TvViewModel @Inject constructor(
         setEpgBackfillInProgress(true)
         completeEpgBackfillJob = viewModelScope.launch(Dispatchers.IO) {
             delay(if (largeList && hasGuideData) 1_500L else if (largeList) 250L else if (hasGuideData) 2_000L else 250L)
-            val backfillResult = runCatching {
+            if (liveTvPlaybackActive) {
+                deferCompleteEpgBackfill(priorityChannelIds)
+                return@launch
+            }
+            val snapshot = try {
                 kotlinx.coroutines.withTimeoutOrNull(900_000L) {
                     iptvRepository.loadSnapshot(
                         forcePlaylistReload = false,
@@ -804,8 +867,11 @@ class TvViewModel @Inject constructor(
                         }
                     )
                 }
-            }
-            backfillResult.onFailure { error ->
+            } catch (error: Throwable) {
+                if (error is kotlinx.coroutines.CancellationException) {
+                    System.err.println("[EPG-Complete] Full guide backfill cancelled")
+                    throw error
+                }
                 AppLogger.recordException(
                     throwable = error,
                     context = mapOf(
@@ -815,8 +881,8 @@ class TvViewModel @Inject constructor(
                         "start_coverage_pct" to ((coverage * 100).toInt()).toString()
                     )
                 )
+                null
             }
-            val snapshot = backfillResult.getOrNull()
             if (snapshot == null) {
                 lastCompleteEpgBackfillKey = null
                 AppLogger.recordException(

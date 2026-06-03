@@ -552,6 +552,12 @@ fun LiveTvScreen(
     val rememberedChannelByCategory = remember { mutableMapOf<String, String>() }
     var playingChannelId by rememberSaveable { mutableStateOf<String?>(initialChannelId) }
     KeepScreenOn(active = playingChannelId != null)
+    LaunchedEffect(playingChannelId) {
+        viewModel.setLiveTvPlaybackActive(playingChannelId != null)
+    }
+    DisposableEffect(Unit) {
+        onDispose { viewModel.setLiveTvPlaybackActive(false) }
+    }
     var focusedChannelId by rememberSaveable { mutableStateOf<String?>(initialChannelId) }
     var epgPrefetchAnchorId by rememberSaveable { mutableStateOf<String?>(initialChannelId) }
     var startupChannelApplied by rememberSaveable(selectedProviderId) { mutableStateOf(false) }
