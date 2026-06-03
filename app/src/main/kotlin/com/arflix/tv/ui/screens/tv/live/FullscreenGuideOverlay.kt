@@ -709,6 +709,8 @@ private fun EnrichedChannel.supportsFullscreenCatchup(): Boolean {
     if (channelSource.catchupDays > 0) return true
     if (!channelSource.catchupType.isNullOrBlank() || !channelSource.catchupSource.isNullOrBlank()) return true
     return channelSource.streamUrl.contains("/timeshift/", ignoreCase = true)
+        || channelSource.xtreamStreamId != null
+        || channelSource.streamUrl.contains("/live/", ignoreCase = true)
 }
 
 private fun startsLabel(program: IptvProgram, nowMillis: Long): String {

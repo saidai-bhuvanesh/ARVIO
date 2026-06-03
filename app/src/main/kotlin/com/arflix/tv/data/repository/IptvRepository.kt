@@ -1066,14 +1066,31 @@ class IptvRepository @Inject constructor(
     )
 
     private fun probePlaybackUrl(url: String, headers: Map<String, String>): PlaybackProbeResult? {
+        val ranged = executePlaybackProbe(url, headers, useRange = true)
+        if (ranged == null || ranged.isPlayable) return ranged
+        if (ranged.statusCode in setOf(403, 405, 416, 500, 502, 503, 513)) {
+            val normal = executePlaybackProbe(url, headers, useRange = false)
+            if (normal?.isPlayable == true) return normal.copy(reason = "ok-no-range")
+            return normal ?: ranged
+        }
+        return ranged
+    }
+
+    private fun executePlaybackProbe(
+        url: String,
+        headers: Map<String, String>,
+        useRange: Boolean
+    ): PlaybackProbeResult? {
         return runCatching {
             val builder = Request.Builder()
                 .url(url)
                 .header("User-Agent", headers["User-Agent"] ?: OkHttpProvider.userAgentOr(IPTV_USER_AGENT))
                 .header("Accept", "*/*")
                 .header("Accept-Encoding", "identity")
-                .header("Range", "bytes=0-0")
                 .get()
+            if (useRange) {
+                builder.header("Range", "bytes=0-0")
+            }
             headers.forEach { (name, value) ->
                 if (name.isNotBlank() && value.isNotBlank() && !name.equals("Range", ignoreCase = true)) {
                     builder.header(name, value)
@@ -6465,6 +6482,7 @@ class IptvRepository @Inject constructor(
         val hasCatchupMetadata = !channel.catchupType.isNullOrBlank() || !channel.catchupSource.isNullOrBlank()
         val hasTimeshiftUrl = channel.streamUrl.contains("/timeshift/", ignoreCase = true)
         if (hasCatchupMetadata || hasTimeshiftUrl) return 7
+        if (channel.xtreamStreamId != null || channel.streamUrl.contains("/live/", ignoreCase = true)) return 2
         if (forceCatchupHistory) return 2
         return 0
     }

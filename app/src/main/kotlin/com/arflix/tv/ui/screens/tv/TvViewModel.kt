@@ -447,7 +447,9 @@ class TvViewModel @Inject constructor(
         if (channel == null) return false
         if (channel.catchupDays > 0) return true
         if (!channel.catchupType.isNullOrBlank() || !channel.catchupSource.isNullOrBlank()) return true
-        return channel.streamUrl.contains("/timeshift/", ignoreCase = true)
+        return channel.streamUrl.contains("/timeshift/", ignoreCase = true) ||
+            channel.xtreamStreamId != null ||
+            channel.streamUrl.contains("/live/", ignoreCase = true)
     }
 
     private fun recentCatchupCount(

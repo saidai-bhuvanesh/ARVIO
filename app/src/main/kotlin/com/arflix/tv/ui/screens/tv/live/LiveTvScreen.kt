@@ -305,6 +305,38 @@ private fun EnrichedChannel?.supportsCatchupHistory(): Boolean {
     if (source.catchupDays > 0) return true
     if (!source.catchupType.isNullOrBlank() || !source.catchupSource.isNullOrBlank()) return true
     return source.streamUrl.contains("/timeshift/", ignoreCase = true)
+        || source.xtreamStreamId != null
+        || source.streamUrl.contains("/live/", ignoreCase = true)
+}
+
+private fun EnrichedChannel.hasExplicitCatchupSource(): Boolean {
+    val source = this.source
+    if (source.catchupDays > 0) return true
+    if (!source.catchupType.isNullOrBlank() || !source.catchupSource.isNullOrBlank()) return true
+    return source.streamUrl.contains("/timeshift/", ignoreCase = true)
+}
+
+private fun catchupQualityRank(channel: EnrichedChannel): Int = when (channel.quality) {
+    Quality.K4 -> 4
+    Quality.FHD -> 3
+    Quality.HD -> 2
+    Quality.SD -> 1
+}
+
+private fun catchupPlaybackVariant(
+    channel: EnrichedChannel,
+    catchupVariantGroups: Map<String, List<EnrichedChannel>>
+): EnrichedChannel {
+    if (channel.hasExplicitCatchupSource()) return channel
+    val variants = catchupVariantGroups[variantGroupKey(channel)].orEmpty()
+    return variants
+        .asSequence()
+        .filter { it.hasExplicitCatchupSource() }
+        .maxWithOrNull(
+            compareBy<EnrichedChannel> { it.source.catchupDays }
+                .thenBy { catchupQualityRank(it) }
+        )
+        ?: channel
 }
 
 @Composable
@@ -511,6 +543,7 @@ fun LiveTvScreen(
     }
     val visibleChannels = visibleEnrichedState.value.all
     val variantGroups = remember(visibleChannels) { buildVariantGroups(visibleChannels) }
+    val catchupVariantGroups = remember(visibleChannels) { visibleChannels.groupBy(::variantGroupKey) }
     val allDisplayChannels = remember(visibleChannels, variantGroups) {
         collapseChannelVariants(visibleChannels, variantGroups)
     }
@@ -1029,19 +1062,45 @@ fun LiveTvScreen(
 
     fun playProgramInMini(channel: EnrichedChannel, program: IptvProgram?) {
         noteGuideUserNavigation()
-        focusedChannelId = channel.id
-        epgPrefetchAnchorId = channel.id
-        rememberedChannelByCategory[selectedCategoryId] = channel.id
-        playingChannelId = channel.id
+        val playbackChannel = if (program != null) {
+            catchupPlaybackVariant(channel, catchupVariantGroups)
+        } else {
+            channel
+        }
+        if (program != null && playbackChannel.id != channel.id) {
+            System.err.println(
+                "[IPTV-Catchup] using archive variant source=${channel.id} playback=${playbackChannel.id} " +
+                    "quality=${playbackChannel.quality.label} days=${playbackChannel.catchupDays}"
+            )
+        }
+        focusedChannelId = playbackChannel.id
+        epgPrefetchAnchorId = playbackChannel.id
+        rememberedChannelByCategory[selectedCategoryId] = playbackChannel.id
+        playingChannelId = playbackChannel.id
         playingCatchupProgram = program
         catchupPlaybackOffsetMs = 0L
         fullscreenGuideOpen = false
-        focusChannelList(channel.id)
+        focusChannelList(playbackChannel.id)
     }
 
     fun playProgramInFullscreen(program: IptvProgram?) {
         if (program != playingCatchupProgram) {
             catchupPlaybackOffsetMs = 0L
+        }
+        if (program != null) {
+            playingChannel?.let { channel ->
+                val playbackChannel = catchupPlaybackVariant(channel, catchupVariantGroups)
+                if (playbackChannel.id != channel.id) {
+                    System.err.println(
+                        "[IPTV-Catchup] using fullscreen archive variant source=${channel.id} " +
+                            "playback=${playbackChannel.id} quality=${playbackChannel.quality.label} " +
+                            "days=${playbackChannel.catchupDays}"
+                    )
+                    playingChannelId = playbackChannel.id
+                    focusedChannelId = playbackChannel.id
+                    epgPrefetchAnchorId = playbackChannel.id
+                }
+            }
         }
         playingCatchupProgram = program
         fullscreenGuideOpen = false

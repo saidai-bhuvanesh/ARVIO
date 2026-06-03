@@ -822,6 +822,7 @@ private data class ProgramFocusTarget(val startMin: Int, val endMin: Int) {
 }
 
 private fun ProgramPlacement.isCatchupSupported(channel: EnrichedChannel, nowMillis: Long): Boolean {
+    if (program.catchupAvailable == true) return true
     val days = effectiveCatchupDays(channel)
     return days > 0 &&
         !isPlaceholder &&
@@ -835,6 +836,7 @@ private fun effectiveCatchupDays(channel: EnrichedChannel): Int {
     val hasCatchupMetadata = !source.catchupType.isNullOrBlank() || !source.catchupSource.isNullOrBlank()
     if (hasCatchupMetadata) return 7
     if (source.streamUrl.contains("/timeshift/", ignoreCase = true)) return 7
+    if (source.xtreamStreamId != null || source.streamUrl.contains("/live/", ignoreCase = true)) return 2
     return 0
 }
 
