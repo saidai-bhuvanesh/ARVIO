@@ -193,6 +193,34 @@ private fun IptvNowNext?.hasGuideData(): Boolean =
     this != null &&
         (now != null || next != null || later != null || upcoming.isNotEmpty() || recent.isNotEmpty())
 
+private fun mergeProgramLists(
+    first: List<IptvProgram>,
+    second: List<IptvProgram>,
+): List<IptvProgram> {
+    if (first.isEmpty()) return second
+    if (second.isEmpty()) return first
+    return (first + second)
+        .distinctBy { "${it.startUtcMillis}:${it.endUtcMillis}:${it.title}" }
+        .sortedBy { it.startUtcMillis }
+}
+
+private fun mergeGuideSlices(
+    primary: IptvNowNext?,
+    secondary: IptvNowNext?,
+): IptvNowNext? {
+    if (!primary.hasGuideData()) return secondary
+    if (!secondary.hasGuideData()) return primary
+    primary ?: return secondary
+    secondary ?: return primary
+    return IptvNowNext(
+        now = primary.now ?: secondary.now,
+        next = primary.next ?: secondary.next,
+        later = primary.later ?: secondary.later,
+        upcoming = mergeProgramLists(primary.upcoming, secondary.upcoming),
+        recent = mergeProgramLists(primary.recent, secondary.recent),
+    )
+}
+
 private fun EnrichedChannel.guideFallbackKeys(): List<String> {
     val playlistId = id.substringBefore(':', missingDelimiterValue = "").trim()
     val prefix = playlistId.ifBlank { "default" }
@@ -504,7 +532,7 @@ fun LiveTvScreen(
                 if (!guide.hasGuideData()) return@forEach
                 val channel = visibleChannelsById[channelId] ?: return@forEach
                 channel.guideFallbackKeys().forEach { key ->
-                    putIfAbsent(key, guide)
+                    put(key, mergeGuideSlices(this[key], guide) ?: guide)
                 }
             }
         }
@@ -512,8 +540,10 @@ fun LiveTvScreen(
     fun guideForChannel(channel: EnrichedChannel?): IptvNowNext? {
         if (channel == null) return null
         val direct = state.snapshot.nowNext[channel.id]
-        if (direct.hasGuideData()) return direct
-        return channel.guideFallbackKeys().firstNotNullOfOrNull { key -> guideByFallbackKey[key] }
+        val fallback = channel.guideFallbackKeys()
+            .mapNotNull { key -> guideByFallbackKey[key] }
+            .fold<IptvNowNext, IptvNowNext?>(null) { merged, next -> mergeGuideSlices(merged, next) }
+        return mergeGuideSlices(direct, fallback)
     }
     // Playing channel — default to the one we were navigated to, else the first
     // channel of the first non-empty category.
@@ -639,11 +669,10 @@ fun LiveTvScreen(
             putAll(state.snapshot.nowNext)
             guideChannels.forEach { channel ->
                 val direct = state.snapshot.nowNext[channel.id]
-                if (!direct.hasGuideData()) {
-                    channel.guideFallbackKeys()
-                        .firstNotNullOfOrNull { key -> guideByFallbackKey[key] }
-                        ?.let { put(channel.id, it) }
-                }
+                val fallback = channel.guideFallbackKeys()
+                    .mapNotNull { key -> guideByFallbackKey[key] }
+                    .fold<IptvNowNext, IptvNowNext?>(null) { merged, next -> mergeGuideSlices(merged, next) }
+                mergeGuideSlices(direct, fallback)?.let { put(channel.id, it) }
             }
         }
     }
