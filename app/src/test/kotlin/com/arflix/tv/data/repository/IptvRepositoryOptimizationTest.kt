@@ -133,4 +133,70 @@ class IptvRepositoryOptimizationTest {
         
         assertEquals("Should not encounter any ConcurrentModificationException", 0, exceptionCount.get())
     }
+
+    @Test
+    fun testGuideKeyCandidatesCaching() {
+        val context = io.mockk.mockk<android.content.Context>(relaxed = true)
+        val okHttpClient = io.mockk.mockk<okhttp3.OkHttpClient>(relaxed = true)
+        val profileManager = io.mockk.mockk<com.arflix.tv.data.repository.ProfileManager>(relaxed = true)
+        val invalidationBus = io.mockk.mockk<com.arflix.tv.data.repository.CloudSyncInvalidationBus>(relaxed = true)
+        val repository = IptvRepository(context, okHttpClient, profileManager, invalidationBus)
+
+        // Get private field guideKeyCandidatesCache using reflection
+        val cacheField = IptvRepository::class.java.getDeclaredField("guideKeyCandidatesCache")
+        cacheField.isAccessible = true
+        val cache = cacheField.get(repository) as Map<*, *>
+
+        val method = IptvRepository::class.java.getDeclaredMethod("guideKeyCandidates", String::class.java)
+        method.isAccessible = true
+
+        val initialSize = cache.size
+        
+        // First call
+        val result1 = method.invoke(repository, "NPO 1 FHD [NL]") as Set<String>
+        val sizeAfterFirst = cache.size
+        assertEquals(initialSize + 1, sizeAfterFirst)
+
+        // Second call with same value (should hit cache)
+        val result2 = method.invoke(repository, "NPO 1 FHD [NL]") as Set<String>
+        assertEquals(sizeAfterFirst, cache.size)
+        assertEquals(result1, result2)
+    }
+
+    @Test
+    fun testFetchAndParseEpgThrows304Exception() {
+        val context = io.mockk.mockk<android.content.Context>(relaxed = true)
+        val okHttpClient = io.mockk.mockk<okhttp3.OkHttpClient>()
+        val profileManager = io.mockk.mockk<com.arflix.tv.data.repository.ProfileManager>(relaxed = true)
+        val invalidationBus = io.mockk.mockk<com.arflix.tv.data.repository.CloudSyncInvalidationBus>(relaxed = true)
+        
+        val builder = io.mockk.mockk<okhttp3.OkHttpClient.Builder>(relaxed = true)
+        io.mockk.every { okHttpClient.newBuilder() } returns builder
+        io.mockk.every { builder.connectTimeout(any(), any()) } returns builder
+        io.mockk.every { builder.readTimeout(any(), any()) } returns builder
+        io.mockk.every { builder.writeTimeout(any(), any()) } returns builder
+        io.mockk.every { builder.callTimeout(any(), any()) } returns builder
+        
+        val customClient = io.mockk.mockk<okhttp3.OkHttpClient>()
+        io.mockk.every { builder.build() } returns customClient
+
+        val call = io.mockk.mockk<okhttp3.Call>()
+        val response = io.mockk.mockk<okhttp3.Response>()
+        io.mockk.every { response.code } returns 304
+        io.mockk.every { response.close() } returns Unit
+        io.mockk.every { call.execute() } returns response
+        io.mockk.every { customClient.newCall(any()) } returns call
+
+        val repository = IptvRepository(context, okHttpClient, profileManager, invalidationBus)
+        val method = IptvRepository::class.java.getDeclaredMethod("fetchAndParseEpg", String::class.java, List::class.java)
+        method.isAccessible = true
+
+        try {
+            method.invoke(repository, "http://example.com/epg.xml", emptyList<com.arflix.tv.data.model.IptvChannel>())
+            fail("Expected EpgNotModifiedException to be thrown")
+        } catch (e: java.lang.reflect.InvocationTargetException) {
+            val cause = e.cause
+            assertEquals(IptvRepository.EpgNotModifiedException::class.java, cause?.javaClass)
+        }
+    }
 }
