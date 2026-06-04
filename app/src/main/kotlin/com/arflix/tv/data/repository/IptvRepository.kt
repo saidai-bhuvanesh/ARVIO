@@ -1417,7 +1417,8 @@ class IptvRepository @Inject constructor(
                             }
                             if (playlistChannels.isNotEmpty()) {
                                 aggregatedChannels += playlistChannels
-                                runCatching { onChannelsReady(aggregatedChannels.toList()) }
+                                val currentList = synchronized(aggregatedChannels) { aggregatedChannels.toList() }
+                                runCatching { onChannelsReady(currentList) }
                             }
                             playlistChannels
                         }
@@ -5998,39 +5999,68 @@ class IptvRepository @Inject constructor(
         input: InputStream
     ) : FilterInputStream(input) {
         override fun read(): Int {
-            val current = super.read()
-            if (current == -1) return -1
+            val buf = ByteArray(1)
+            val read = read(buf, 0, 1)
+            return if (read <= 0) -1 else buf[0].toInt() and 0xFF
+        }
 
-            val mapped = if (current == '\\'.code) {
-                val next = super.read()
-                if (next == -1) {
-                    current
-                } else {
-                    when (next.toChar()) {
-                        '\\' -> '\\'.code
-                        '"' -> '"'.code
-                        '\'' -> '\''.code
-                        '/' -> '/'.code
-                        'n' -> '\n'.code
-                        'r' -> '\r'.code
-                        't' -> '\t'.code
-                        'b' -> '\b'.code
-                        'f' -> 0x0C
-                        else -> {
-                            // Unknown escape (for example \y): drop the slash and keep the char.
-                            next
-                        }
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (len == 0) return 0
+            
+            // Read from the underlying stream
+            val rawRead = super.read(b, off, len)
+            if (rawRead == -1) return -1
+            
+            var writeIdx = off
+            var readIdx = off
+            val endIdx = off + rawRead
+            
+            while (readIdx < endIdx) {
+                val current = b[readIdx++].toInt() and 0xFF
+                if (current == '\\'.code) {
+                    val next = if (readIdx < endIdx) {
+                        b[readIdx++].toInt() and 0xFF
+                    } else {
+                        // The backslash is at the very end of the read chunk.
+                        // Fetch the next byte from the underlying stream.
+                        val n = super.read()
+                        if (n == -1) -1 else n
                     }
+                    
+                    if (next == -1) {
+                        b[writeIdx++] = '\\'.toByte()
+                    } else {
+                        val mapped = when (next.toChar()) {
+                            '\\' -> '\\'.code
+                            '"' -> '"'.code
+                            '\'' -> '\''.code
+                            '/' -> '/'.code
+                            'n' -> '\n'.code
+                            'r' -> '\r'.code
+                            't' -> '\t'.code
+                            'b' -> '\b'.code
+                            'f' -> 0x0C
+                            else -> next
+                        }
+                        
+                        val finalChar = if (mapped in 0x00..0x1F && mapped != '\n'.code && mapped != '\r'.code && mapped != '\t'.code) {
+                            ' '.code
+                        } else {
+                            mapped
+                        }
+                        b[writeIdx++] = finalChar.toByte()
+                    }
+                } else {
+                    val finalChar = if (current in 0x00..0x1F && current != '\n'.code && current != '\r'.code && current != '\t'.code) {
+                        ' '.code
+                    } else {
+                        current
+                    }
+                    b[writeIdx++] = finalChar.toByte()
                 }
-            } else {
-                current
             }
-
-            // XML 1.0 forbids most control chars; normalize them to space.
-            if (mapped in 0x00..0x1F && mapped != '\n'.code && mapped != '\r'.code && mapped != '\t'.code) {
-                return ' '.code
-            }
-            return mapped
+            
+            return writeIdx - off
         }
     }
 
