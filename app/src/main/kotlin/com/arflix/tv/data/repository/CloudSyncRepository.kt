@@ -549,6 +549,9 @@ class CloudSyncRepository @Inject constructor(
     var pushFailureCount: Int = 0
         private set
 
+    @Volatile
+    private var lastPushAttemptAt: Long = 0L
+
     // ══════════════════════════════════════════════════════════
     //  PUSH LOCAL STATE TO CLOUD
     // ══════════════════════════════════════════════════════════
@@ -558,6 +561,20 @@ class CloudSyncRepository @Inject constructor(
     }
 
     private suspend fun pushToCloudLocked(): Result<Unit> {
+        val now = System.currentTimeMillis()
+        if (pushFailureCount > 0) {
+            val requiredBackoffMs = (2_000L * (1 shl (pushFailureCount - 1).coerceAtMost(6))).coerceAtMost(300_000L)
+            if (now - lastPushAttemptAt < requiredBackoffMs) {
+                AppLogger.breadcrumb(
+                    tag = "CloudSync",
+                    message = "push_skipped_backoff delay=${requiredBackoffMs}",
+                    severity = "info"
+                )
+                return Result.failure(IllegalStateException("Exponential backoff active: wait ${requiredBackoffMs}ms"))
+            }
+        }
+        lastPushAttemptAt = now
+
         if (authRepository.getCurrentUserId().isNullOrBlank()) {
             AppLogger.breadcrumb(
                 tag = "CloudSync",

@@ -25,7 +25,7 @@ class CloudSyncWorker @AssistedInject constructor(
 
     override suspend fun doWork(): Result {
         Log.i(TAG, "Executing background cloud sync recovery")
-        
+
         // If not dirty, nothing to do
         if (!cloudSyncRepository.isPushDirty) {
             Log.i(TAG, "Cloud state is not dirty. Skipping sync.")
@@ -60,7 +60,7 @@ class CloudSyncWorker @AssistedInject constructor(
                 .setConstraints(constraints)
                 .setBackoffCriteria(
                     BackoffPolicy.EXPONENTIAL,
-                    WorkManager.MIN_BACKOFF_MILLIS,
+                    androidx.work.WorkRequest.MIN_BACKOFF_MILLIS,
                     TimeUnit.MILLISECONDS
                 )
                 .build()
