@@ -6112,15 +6112,15 @@ class IptvRepository @Inject constructor(
 
         override fun read(b: ByteArray, off: Int, len: Int): Int {
             if (len == 0) return 0
-            
+
             // Read from the underlying stream
             val rawRead = super.read(b, off, len)
             if (rawRead == -1) return -1
-            
+
             var writeIdx = off
             var readIdx = off
             val endIdx = off + rawRead
-            
+
             while (readIdx < endIdx) {
                 val current = b[readIdx++].toInt() and 0xFF
                 if (current == '\\'.code) {
@@ -6132,7 +6132,7 @@ class IptvRepository @Inject constructor(
                         val n = super.read()
                         if (n == -1) -1 else n
                     }
-                    
+
                     if (next == -1) {
                         b[writeIdx++] = '\\'.toByte()
                     } else {
@@ -6148,7 +6148,7 @@ class IptvRepository @Inject constructor(
                             'f' -> 0x0C
                             else -> next
                         }
-                        
+
                         val finalChar = if (mapped in 0x00..0x1F && mapped != '\n'.code && mapped != '\r'.code && mapped != '\t'.code) {
                             ' '.code
                         } else {
@@ -6165,7 +6165,7 @@ class IptvRepository @Inject constructor(
                     b[writeIdx++] = finalChar.toByte()
                 }
             }
-            
+
             return writeIdx - off
         }
     }
