@@ -1,6 +1,7 @@
 package com.arflix.tv.ui.screens.details
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -120,6 +121,7 @@ import androidx.tv.material3.Text
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import coil.ImageLoader
+import coil.imageLoader
 import coil.compose.AsyncImage
 import coil.compose.SubcomposeAsyncImage
 import coil.decode.SvgDecoder
@@ -1147,22 +1149,7 @@ private fun handleRight(
     return true
 }
 
-@OptIn(ExperimentalTvMaterial3Api::class)
-@Composable
-private fun rememberMetadataLogoImageLoader(context: Context): ImageLoader {
-    return remember(context) {
-        ImageLoader.Builder(context)
-            .okHttpClient(OkHttpProvider.coilClient)
-            .components {
-                add(SvgDecoder.Factory())
-            }
-            .allowRgb565(false)
-            .crossfade(false)
-            .placeholder(android.R.color.transparent)
-            .error(android.R.color.transparent)
-            .build()
-    }
-}
+
 
 @Composable
 private fun DetailsContent(
@@ -1208,7 +1195,7 @@ private fun DetailsContent(
     onCollectionClick: (Int) -> Unit = {}
 ) {
     val context = LocalContext.current
-    val metadataLogoImageLoader = rememberMetadataLogoImageLoader(context)
+    val metadataLogoImageLoader = context.imageLoader
     val focusSectionForUi = if (contentHasFocus) focusedSection else null
     // === PREMIUM LAYERED TEXT SHADOWS ===
     val textShadow = Shadow(
@@ -1929,8 +1916,15 @@ private fun DetailsContent(
 
                     if (primaryNetworkLogo != null) {
                         Text(text = "|", style = separatorStyle, color = Color.White.copy(alpha = 0.7f))
+                        val networkLogoRequest = remember(primaryNetworkLogo, context) {
+                            ImageRequest.Builder(context)
+                                .data(primaryNetworkLogo)
+                                .bitmapConfig(Bitmap.Config.ARGB_8888)
+                                .allowRgb565(false)
+                                .build()
+                        }
                         AsyncImage(
-                            model = primaryNetworkLogo,
+                            model = networkLogoRequest,
                             imageLoader = metadataLogoImageLoader,
                             contentDescription = "Primary streaming provider",
                             contentScale = ContentScale.Fit,
@@ -2967,13 +2961,21 @@ private fun DetailsImdbSvgRatingBadge(
     logoHeight: Dp,
     textShadow: Shadow
 ) {
+    val context = LocalContext.current
     val imdbLogoUri = remember { "android.resource://com.arvio.tv/${R.raw.logo_imdb_rectangle}" }
+    val request = remember(imdbLogoUri, context) {
+        ImageRequest.Builder(context)
+            .data(imdbLogoUri)
+            .bitmapConfig(Bitmap.Config.ARGB_8888)
+            .allowRgb565(false)
+            .build()
+    }
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(3.dp)
     ) {
         AsyncImage(
-            model = imdbLogoUri,
+            model = request,
             imageLoader = imageLoader,
             contentDescription = "IMDb",
             contentScale = ContentScale.Fit,
@@ -3300,7 +3302,7 @@ private fun EpisodeCard(
     val aspectRatio = 16f / 9f
     val context = LocalContext.current
     val density = LocalDensity.current
-    val metadataLogoImageLoader = rememberMetadataLogoImageLoader(context)
+    val metadataLogoImageLoader = context.imageLoader
 
     val shape = rememberArvioCardShape(ArvioSkin.radius.md)
     val scale by animateFloatAsState(

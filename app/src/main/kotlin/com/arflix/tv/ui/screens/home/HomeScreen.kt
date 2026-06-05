@@ -3,6 +3,7 @@
 package com.arflix.tv.ui.screens.home
 
 import android.content.Context
+import android.graphics.Bitmap
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -120,6 +121,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Text
 import coil.ImageLoader
+import coil.imageLoader
 import coil.compose.AsyncImage
 import coil.decode.SvgDecoder
 import coil.request.ImageRequest
@@ -413,21 +415,7 @@ private suspend fun androidx.compose.foundation.lazy.LazyListState.animateHomeSc
     }
 }
 
-@Composable
-private fun rememberMetadataLogoImageLoader(context: Context): ImageLoader {
-    return remember(context) {
-        ImageLoader.Builder(context)
-            .okHttpClient(OkHttpProvider.coilClient)
-            .components {
-                add(SvgDecoder.Factory())
-            }
-            .allowRgb565(false)
-            .crossfade(false)
-            .placeholder(android.R.color.transparent)
-            .error(android.R.color.transparent)
-            .build()
-    }
-}
+
 
 @Composable
 private fun HomeBackdropCrossfade(
@@ -1291,7 +1279,7 @@ private fun HeroSection(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val metadataLogoImageLoader = rememberMetadataLogoImageLoader(context)
+    val metadataLogoImageLoader = context.imageLoader
     val density = LocalDensity.current
     val logoSize = remember(density) {
         val widthPx = with(density) { 320.dp.roundToPx() }
@@ -1343,6 +1331,8 @@ private fun HeroSection(
                             val cacheKey = "$currentLogoUrl|${logoWidthPx}x$logoHeightPx"
                             ImageRequest.Builder(context)
                                 .data(currentLogoUrl)
+                                .bitmapConfig(Bitmap.Config.ARGB_8888)
+                                .allowRgb565(false)
                                 .size(logoWidthPx, logoHeightPx)
                                 .precision(Precision.INEXACT)
                                 .allowHardware(true)
@@ -1539,8 +1529,15 @@ private fun HeroSection(
                                 modifier = Modifier.fillMaxWidth()
                             ) {
                                 if (primaryNetworkLogo != null) {
+                                    val networkLogoRequest = remember(primaryNetworkLogo, context) {
+                                        ImageRequest.Builder(context)
+                                            .data(primaryNetworkLogo)
+                                            .bitmapConfig(Bitmap.Config.ARGB_8888)
+                                            .allowRgb565(false)
+                                            .build()
+                                    }
                                     AsyncImage(
-                                        model = primaryNetworkLogo,
+                                        model = networkLogoRequest,
                                         imageLoader = metadataLogoImageLoader,
                                         contentDescription = "Primary streaming provider",
                                         contentScale = ContentScale.Fit,
@@ -1749,7 +1746,7 @@ private fun MobileHeroOverlay(
     onDetails: () -> Unit
 ) {
     val context = LocalContext.current
-    val metadataLogoImageLoader = rememberMetadataLogoImageLoader(context)
+    val metadataLogoImageLoader = context.imageLoader
     val mobileHeroGradient = remember {
         Brush.verticalGradient(
             listOf(
@@ -3139,13 +3136,21 @@ private fun ImdbSvgRatingBadge(
     logoHeight: Dp,
     textShadow: Shadow
 ) {
+    val context = LocalContext.current
     val imdbLogoUri = remember { "android.resource://com.arvio.tv/${R.raw.logo_imdb_rectangle}" }
+    val request = remember(imdbLogoUri, context) {
+        ImageRequest.Builder(context)
+            .data(imdbLogoUri)
+            .bitmapConfig(Bitmap.Config.ARGB_8888)
+            .allowRgb565(false)
+            .build()
+    }
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(3.dp)
     ) {
         AsyncImage(
-            model = imdbLogoUri,
+            model = request,
             imageLoader = imageLoader,
             contentDescription = "IMDb",
             contentScale = ContentScale.Fit,
