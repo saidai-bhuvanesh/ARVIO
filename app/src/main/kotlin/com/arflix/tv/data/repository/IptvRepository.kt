@@ -31,6 +31,7 @@ import okhttp3.Callback
 import okhttp3.Response
 import java.io.IOException
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -77,6 +78,7 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.xml.parsers.SAXParserFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
@@ -1533,6 +1535,8 @@ class IptvRepository @Inject constructor(
                     val shortEpgAttempt = runCatching {
                         fetchXtreamShortEpgForActiveProviders(config, channels, onProgress)
                     }
+                    val shortEpgEx = shortEpgAttempt.exceptionOrNull()
+                    if (shortEpgEx is kotlinx.coroutines.CancellationException) throw shortEpgEx
                     if (shortEpgAttempt.isSuccess) {
                         val parsed = shortEpgAttempt.getOrNull()
                         val parsedHasData = parsed != null && hasAnyProgramData(parsed)
@@ -1585,6 +1589,8 @@ class IptvRepository @Inject constructor(
                             withTimeoutOrNull(300_000L) { fetchAndParseEpg(epgUrl, candidateChannels) }
                                 ?: throw java.util.concurrent.TimeoutException("EPG download timed out for ${epgUrl.take(80)}")
                         }
+                        val attemptEx = attempt.exceptionOrNull()
+                        if (attemptEx is kotlinx.coroutines.CancellationException) throw attemptEx
                         if (attempt.isSuccess) {
                             val parsed = attempt.getOrDefault(emptyMap())
                             val parsedHasPrograms = hasAnyProgramData(parsed)
@@ -1613,12 +1619,15 @@ class IptvRepository @Inject constructor(
                             val exception = attempt.exceptionOrNull()
                             if (exception is EpgNotModifiedException) {
                                 System.err.println("[EPG] XMLTV candidate ${index + 1} is unchanged (HTTP 304). Loading existing index...")
-                                val existing = runCatching {
+                                val existingAttempt = runCatching {
                                     epgIndex.loadNowNext(
                                         sourceKey = currentEpgIndexKey(config),
                                         channelIds = candidateChannels.map { it.id }.toSet()
                                     )
-                                }.getOrDefault(emptyMap())
+                                }
+                                val existingEx = existingAttempt.exceptionOrNull()
+                                if (existingEx is kotlinx.coroutines.CancellationException) throw existingEx
+                                val existing = existingAttempt.getOrDefault(emptyMap())
                                 existing.forEach { (channelId, nowNext) ->
                                     val current = mergedXmlNowNext[channelId]
                                     if (!hasProgramData(current) && hasProgramData(nowNext)) {
@@ -2294,24 +2303,31 @@ class IptvRepository @Inject constructor(
                     "for ${candidateChannels.size} channels"
             )
             var isCached = false
-            val parsed = runCatching {
+            val parsedAttempt = runCatching {
                 withTimeoutOrNull(12_000L) {
                     fetchAndParseEpg(candidate.url, candidateChannels)
                 } ?: emptyMap()
             }.recover { error ->
+                if (error is kotlinx.coroutines.CancellationException) throw error
                 if (error is EpgNotModifiedException) {
                     System.err.println("[EPG-Refresh] XMLTV visible fallback candidate is unchanged (HTTP 304). Loading existing index...")
                     isCached = true
-                    runCatching {
+                    val existingAttempt = runCatching {
                         epgIndex.loadNowNext(
                             sourceKey = currentEpgIndexKey(config),
                             channelIds = candidateChannels.map { it.id }.toSet()
                         )
-                    }.getOrDefault(emptyMap())
+                    }
+                    val existingEx = existingAttempt.exceptionOrNull()
+                    if (existingEx is kotlinx.coroutines.CancellationException) throw existingEx
+                    existingAttempt.getOrDefault(emptyMap())
                 } else {
                     throw error
                 }
-            }.onFailure { error ->
+            }
+            val parsedEx = parsedAttempt.exceptionOrNull()
+            if (parsedEx is kotlinx.coroutines.CancellationException) throw parsedEx
+            val parsed = parsedAttempt.onFailure { error ->
                 System.err.println("[EPG-Refresh] XMLTV visible fallback failed: ${error.message}")
             }.getOrDefault(emptyMap())
 
@@ -2470,6 +2486,7 @@ class IptvRepository @Inject constructor(
         cachedVodIndex = null
         cachedVodIdIndex = null
         clearIptvMovieSourceCache()
+        guideKeyCandidatesCache.clear()
         // Keep disk VOD/series catalogs. They are credential-keyed and TTL checked;
         // deleting them during a generic refresh can race with playback source resolution.
     }
@@ -2812,11 +2829,14 @@ class IptvRepository @Inject constructor(
         val maxAttempts = 2
         repeat(maxAttempts) { attempt ->
             onProgress(IptvLoadProgress("Connecting to playlist (attempt ${attempt + 1}/$maxAttempts)...", 5))
-            runCatching {
+            val m3uAttempt = runCatching {
                 withTimeoutOrNull(90_000L) {
                     fetchAndParseM3uOnce(url, onProgress)
                 } ?: throw IllegalStateException("Playlist loading timed out. Try refreshing or using the provider's Xtream credentials.")
-            }.onSuccess { channels ->
+            }
+            val m3uEx = m3uAttempt.exceptionOrNull()
+            if (m3uEx is kotlinx.coroutines.CancellationException) throw m3uEx
+            m3uAttempt.onSuccess { channels ->
                 if (channels.isNotEmpty()) return channels
                 lastError = IllegalStateException("Playlist loaded but contains no channels.")
             }.onFailure { error ->
@@ -5127,7 +5147,7 @@ class IptvRepository @Inject constructor(
         })
     }
 
-    private fun fetchAndParseM3uOnce(
+    private suspend fun fetchAndParseM3uOnce(
         url: String,
         onProgress: (IptvLoadProgress) -> Unit
     ): List<IptvChannel> {
@@ -5137,10 +5157,11 @@ class IptvRepository @Inject constructor(
             .header("Accept", "*/*")
             .get()
             .build()
-        iptvHttpClient.newCall(request).execute().use { response ->
+        iptvHttpClient.executeCancellable(request).use { response ->
             val raw = response.body?.byteStream() ?: throw IllegalStateException("M3U response was empty.")
+            val boundedRaw = BoundedInputStream(raw, MAX_M3U_DOWNLOAD_BYTES)
             val contentLength = response.body?.contentLength()?.takeIf { it > 0L }
-            val progressStream = ProgressInputStream(raw) { bytesRead ->
+            val progressStream = ProgressInputStream(boundedRaw) { bytesRead ->
                 if (contentLength != null) {
                     val pct = ((bytesRead * 70L) / contentLength).toInt().coerceIn(8, 74)
                     onProgress(IptvLoadProgress("Downloading playlist... $pct%", pct))
@@ -5174,7 +5195,7 @@ class IptvRepository @Inject constructor(
         }
     }
 
-    private fun fetchAndParseEpg(url: String, channels: List<IptvChannel>): Map<String, IptvNowNext> {
+    private suspend fun fetchAndParseEpg(url: String, channels: List<IptvChannel>): Map<String, IptvNowNext> {
         val hasDbEntries = currentEpgIndexKey.isNotBlank() && runCatching {
             epgIndex.countPrograms(currentEpgIndexKey)
         }.getOrDefault(0) > 0
@@ -5201,16 +5222,16 @@ class IptvRepository @Inject constructor(
 
         val primaryUserAgent = OkHttpProvider.userAgentOr(IPTV_USER_AGENT)
         val fallbackUserAgent = OkHttpProvider.userAgentOr(BROWSER_USER_AGENT)
-        var response = iptvHttpClient.newCall(epgRequest(url, primaryUserAgent)).execute()
+        var response = iptvHttpClient.executeCancellable(epgRequest(url, primaryUserAgent))
         if (response.code == 304) {
             response.close()
             throw EpgNotModifiedException()
         }
         if (!response.isSuccessful && response.code in setOf(511, 403, 401)) {
             response.close()
-            response = iptvHttpClient.newCall(
+            response = iptvHttpClient.executeCancellable(
                 epgRequest(url, fallbackUserAgent)
-            ).execute()
+            )
             if (response.code == 304) {
                 response.close()
                 throw EpgNotModifiedException()
@@ -5244,9 +5265,9 @@ class IptvRepository @Inject constructor(
                 val tmpFile = File.createTempFile("epg_", ".xml", context.cacheDir)
                 try {
                     // Re-download
-                    val retryResponse = iptvHttpClient.newCall(
+                    val retryResponse = iptvHttpClient.executeCancellable(
                         epgRequest(url, primaryUserAgent, forceFull = true)
-                    ).execute()
+                    )
                     retryResponse.use { rr ->
                         val retryStream = rr.body?.byteStream()
                             ?: throw IllegalStateException("Empty EPG retry response")
@@ -6170,7 +6191,7 @@ class IptvRepository @Inject constructor(
         }
     }
 
-    private fun parseM3u(
+    private suspend fun parseM3u(
         input: InputStream,
         onProgress: (IptvLoadProgress) -> Unit
     ): List<IptvChannel> {
@@ -6179,10 +6200,15 @@ class IptvRepository @Inject constructor(
         var pendingMetadata: String? = null
         val pendingHeaders = linkedMapOf<String, String>()
         var parsedCount = 0
+        var lineCount = 0
 
         BufferedReader(InputStreamReader(input, StandardCharsets.UTF_8), 256 * 1024).use { reader ->
             while (true) {
                 val rawLine = reader.readLine() ?: break
+                lineCount++
+                if (lineCount % 500 == 0) {
+                    yield()
+                }
                 val line = rawLine.trim()
                 if (line.isEmpty()) continue
 
@@ -6206,6 +6232,25 @@ class IptvRepository @Inject constructor(
 
                 if (line.startsWith("#")) continue
 
+                val isUriValid = line.startsWith("http://", ignoreCase = true) ||
+                        line.startsWith("https://", ignoreCase = true) ||
+                        line.startsWith("rtmp://", ignoreCase = true) ||
+                        line.startsWith("rtsp://", ignoreCase = true) ||
+                        line.startsWith("udp://", ignoreCase = true) ||
+                        line.startsWith("rtp://", ignoreCase = true) ||
+                        line.startsWith("mms://", ignoreCase = true) ||
+                        line.startsWith("file://", ignoreCase = true) ||
+                        (!line.contains(" ") && !line.contains("#") && !line.contains("\r") && !line.contains("\n"))
+
+                if (!isUriValid) {
+                    pendingHeaders.clear()
+                    continue
+                }
+
+                if (channels.size >= MAX_PLAYLIST_CHANNELS) {
+                    break
+                }
+
                 val metadata = pendingMetadata
                 pendingMetadata = null
 
@@ -6217,7 +6262,8 @@ class IptvRepository @Inject constructor(
                 }
 
                 val tvgName = extractAttr(metadata, "tvg-name")
-                val channelName = tvgName?.takeIf { it.isNotBlank() } ?: extractChannelName(metadata)
+                val rawChannelName = tvgName?.takeIf { it.isNotBlank() } ?: extractChannelName(metadata)
+                val channelName = rawChannelName.trim().takeIf { it.isNotBlank() } ?: "Unnamed Channel"
                 val groupTitle = extractAttr(metadata, "group-title")?.takeIf { it.isNotBlank() } ?: "Uncategorized"
                 val logo = extractAttr(metadata, "tvg-logo")
                 val catchupType = extractAttr(metadata, "catchup")
@@ -6277,7 +6323,7 @@ class IptvRepository @Inject constructor(
             .distinct()
     }
 
-    private fun parseXmlTvNowNext(
+    private suspend fun parseXmlTvNowNext(
         input: InputStream,
         channels: List<IptvChannel>
     ): Map<String, IptvNowNext> {
@@ -6308,7 +6354,12 @@ class IptvRepository @Inject constructor(
         parser.setInput(input, null)
         var eventType = parser.eventType
 
+        var eventCount = 0
         while (eventType != XmlPullParser.END_DOCUMENT) {
+            eventCount++
+            if (eventCount % 1000 == 0) {
+                yield()
+            }
             when (eventType) {
                 XmlPullParser.START_TAG -> {
                     when (parser.name.lowercase(Locale.US)) {
@@ -6394,12 +6445,13 @@ class IptvRepository @Inject constructor(
         return buildParsedNowNextResult(channels, nowCandidates, upcomingCandidates, recentCandidates)
     }
 
-    private fun parseXmlTvNowNextWithSax(
+    private suspend fun parseXmlTvNowNextWithSax(
         input: InputStream,
         channels: List<IptvChannel>
     ): Map<String, IptvNowNext> {
         if (channels.isEmpty()) return emptyMap()
 
+        val job = kotlin.coroutines.coroutineContext[kotlinx.coroutines.Job]
         val nowUtc = System.currentTimeMillis()
         val recentCutoff = xmlTvRecentCutoff(channels, nowUtc)
         val futureCutoff = nowUtc + xmlTvFutureWindowMs
@@ -6434,7 +6486,14 @@ class IptvRepository @Inject constructor(
         val textBuffer = StringBuilder(128)
 
         val handler = object : DefaultHandler() {
+            var elementCount = 0
             override fun startElement(uri: String?, localName: String?, qName: String?, attributes: Attributes?) {
+                elementCount++
+                if (elementCount % 1000 == 0) {
+                    if (job?.isActive == false) {
+                        throw kotlinx.coroutines.CancellationException("Coroutine was cancelled")
+                    }
+                }
                 val name = (localName ?: qName ?: "").lowercase(Locale.US)
                 when (name) {
                     "channel" -> {
@@ -7117,17 +7176,19 @@ class IptvRepository @Inject constructor(
     }
 
     private fun prepareInputStream(source: InputStream, url: String): InputStream {
-        val buffered = BufferedInputStream(source)
+        val boundedSource = BoundedInputStream(source, MAX_XMLTV_DOWNLOAD_BYTES)
+        val buffered = BufferedInputStream(boundedSource)
         buffered.mark(4)
         val b1 = buffered.read()
         val b2 = buffered.read()
         buffered.reset()
         val isGzipMagic = b1 == 0x1f && b2 == 0x8b
-        return if (isGzipMagic || url.lowercase(Locale.US).endsWith(".gz")) {
+        val decompressed = if (isGzipMagic || url.lowercase(Locale.US).endsWith(".gz")) {
             GZIPInputStream(buffered)
         } else {
             buffered
         }
+        return BoundedInputStream(decompressed, MAX_XMLTV_DECOMPRESSED_BYTES)
     }
 
     private fun looksLikeM3u(source: InputStream): Boolean {
@@ -7178,9 +7239,32 @@ class IptvRepository @Inject constructor(
         runCatching {
             val dir = File(context.filesDir, "iptv_cache")
             if (!dir.exists()) return
-            dir.listFiles { _, name -> name.endsWith("_iptv_cache.json") }?.forEach { file ->
-                if (file.length() > MAX_IPTV_CACHE_BYTES * 2) {
-                    runCatching { file.delete() }
+
+            val allFiles = dir.listFiles() ?: return
+            allFiles.forEach { file ->
+                val name = file.name
+                if (name.endsWith("_iptv_cache.json") || name.endsWith("_iptv_channels_cache.json")) {
+                    if (file.length() > MAX_IPTV_CACHE_BYTES * 2) {
+                        runCatching { file.delete() }
+                    }
+                }
+            }
+
+            val remainingFiles = dir.listFiles() ?: return
+            var totalSize = remainingFiles.sumOf { it.length() }
+            val limitBytes = 100 * 1024 * 1024L
+            val targetBytes = 80 * 1024 * 1024L
+
+            if (totalSize > limitBytes) {
+                val sorted = remainingFiles.sortedBy { it.lastModified() }
+                for (file in sorted) {
+                    val fileSize = file.length()
+                    if (file.delete()) {
+                        totalSize -= fileSize
+                        if (totalSize <= targetBytes) {
+                            break
+                        }
+                    }
                 }
             }
         }
@@ -7447,7 +7531,8 @@ class IptvRepository @Inject constructor(
         val b1 = stream.read()
         val b2 = stream.read()
         stream.reset()
-        val source = if (b1 == 0x1f && b2 == 0x8b) GZIPInputStream(stream) else stream
+        val decompressed = if (b1 == 0x1f && b2 == 0x8b) GZIPInputStream(stream) else stream
+        val source = BoundedInputStream(decompressed, MAX_DECOMPRESSED_CACHE_BYTES)
         return JsonReader(InputStreamReader(source, StandardCharsets.UTF_8))
     }
 
@@ -7495,10 +7580,14 @@ class IptvRepository @Inject constructor(
             bytes[0] == 0x1f.toByte() &&
             bytes[1] == 0x8b.toByte()
         return if (isGzip) {
-            GZIPInputStream(ByteArrayInputStream(bytes))
+            val gzipStream = GZIPInputStream(ByteArrayInputStream(bytes))
+            BoundedInputStream(gzipStream, MAX_DECOMPRESSED_CACHE_BYTES)
                 .bufferedReader(StandardCharsets.UTF_8)
                 .use { it.readText() }
         } else {
+            if (bytes.size.toLong() > MAX_DECOMPRESSED_CACHE_BYTES) {
+                throw SecurityException("Cache bytes exceed max limit")
+            }
             bytes.toString(StandardCharsets.UTF_8)
         }
     }
@@ -8074,6 +8163,86 @@ class IptvRepository @Inject constructor(
         synchronized(iptvPersistLock) { iptvMovieSourcePersistJob?.cancel() }
     }
 
+    private class BoundedInputStream(
+        private val delegate: InputStream,
+        private val maxBytes: Long
+    ) : InputStream() {
+        private var bytesRead = 0L
+        private var markedBytes = 0L
+
+        override fun read(): Int {
+            val b = delegate.read()
+            if (b != -1) {
+                incrementBytes(1)
+            }
+            return b
+        }
+
+        override fun read(b: ByteArray): Int {
+            return read(b, 0, b.size)
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            val read = delegate.read(b, off, len)
+            if (read > 0) {
+                incrementBytes(read.toLong())
+            }
+            return read
+        }
+
+        override fun skip(n: Long): Long {
+            val skipped = delegate.skip(n)
+            if (skipped > 0) {
+                incrementBytes(skipped)
+            }
+            return skipped
+        }
+
+        override fun available(): Int = delegate.available()
+        override fun close() = delegate.close()
+
+        override fun mark(readlimit: Int) {
+            delegate.mark(readlimit)
+            markedBytes = bytesRead
+        }
+
+        override fun reset() {
+            delegate.reset()
+            bytesRead = markedBytes
+        }
+
+        override fun markSupported(): Boolean = delegate.markSupported()
+
+        private fun incrementBytes(count: Long) {
+            bytesRead += count
+            if (bytesRead > maxBytes) {
+                throw SecurityException("Limit exceeded: $bytesRead bytes read, max allowed is $maxBytes")
+            }
+        }
+    }
+
+    private suspend fun OkHttpClient.executeCancellable(request: Request): Response = suspendCancellableCoroutine { continuation ->
+        val call = this.newCall(request)
+        continuation.invokeOnCancellation {
+            call.cancel()
+        }
+        call.enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                if (continuation.isActive) {
+                    continuation.resumeWithException(e)
+                }
+            }
+
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                if (continuation.isActive) {
+                    continuation.resume(response)
+                } else {
+                    response.close()
+                }
+            }
+        })
+    }
+
     // ════════════════════════════════════════════════════════════════════════
 
     private companion object {
@@ -8087,6 +8256,11 @@ class IptvRepository @Inject constructor(
         const val ANDROID_KEYSTORE = "AndroidKeyStore"
         const val CONFIG_KEY_ALIAS = "arvio_iptv_config_v1"
         const val MAX_IPTV_CACHE_BYTES = 25L * 1024L * 1024L
+        const val MAX_XMLTV_DOWNLOAD_BYTES = 150 * 1024 * 1024L
+        const val MAX_XMLTV_DECOMPRESSED_BYTES = 350 * 1024 * 1024L
+        const val MAX_M3U_DOWNLOAD_BYTES = 75 * 1024 * 1024L
+        const val MAX_DECOMPRESSED_CACHE_BYTES = 100 * 1024 * 1024L
+        const val MAX_PLAYLIST_CHANNELS = 150_000
         const val IPTV_USER_AGENT = "VLC/3.0.20 LibVLC/3.0.20"
         const val BROWSER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 

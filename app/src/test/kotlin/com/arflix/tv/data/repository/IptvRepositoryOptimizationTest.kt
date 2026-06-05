@@ -4,11 +4,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Assert.fail
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.InputStream
+import java.io.File
 import java.lang.reflect.Constructor
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
@@ -163,8 +169,67 @@ class IptvRepositoryOptimizationTest {
         assertEquals(result1, result2)
     }
 
+    private suspend fun callFetchAndParseEpgReflection(
+        repository: IptvRepository,
+        url: String,
+        channels: List<com.arflix.tv.data.model.IptvChannel>
+    ): Map<String, com.arflix.tv.data.model.IptvNowNext> {
+        val method = IptvRepository::class.java.getDeclaredMethod(
+            "fetchAndParseEpg",
+            String::class.java,
+            List::class.java,
+            kotlin.coroutines.Continuation::class.java
+        )
+        method.isAccessible = true
+        return suspendCancellableCoroutine { continuation ->
+            try {
+                val result = method.invoke(repository, url, channels, continuation)
+                if (result != kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED) {
+                    continuation.resume(result as Map<String, com.arflix.tv.data.model.IptvNowNext>)
+                }
+            } catch (e: java.lang.reflect.InvocationTargetException) {
+                continuation.resumeWithException(e.cause ?: e)
+            } catch (e: Exception) {
+                continuation.resumeWithException(e)
+            }
+        }
+    }
+
+    private suspend fun callParseM3uReflection(
+        repository: IptvRepository,
+        input: InputStream,
+        onProgress: (IptvLoadProgress) -> Unit
+    ): List<com.arflix.tv.data.model.IptvChannel> {
+        val method = IptvRepository::class.java.getDeclaredMethod(
+            "parseM3u",
+            InputStream::class.java,
+            Function1::class.java,
+            kotlin.coroutines.Continuation::class.java
+        )
+        method.isAccessible = true
+        return suspendCancellableCoroutine { continuation ->
+            try {
+                val result = method.invoke(repository, input, onProgress, continuation)
+                if (result != kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED) {
+                    continuation.resume(result as List<com.arflix.tv.data.model.IptvChannel>)
+                }
+            } catch (e: java.lang.reflect.InvocationTargetException) {
+                continuation.resumeWithException(e.cause ?: e)
+            } catch (e: Exception) {
+                continuation.resumeWithException(e)
+            }
+        }
+    }
+
+    private fun createBoundedInputStream(input: InputStream, maxBytes: Long): InputStream {
+        val clazz = Class.forName("com.arflix.tv.data.repository.IptvRepository\$BoundedInputStream")
+        val constructor = clazz.getDeclaredConstructor(InputStream::class.java, Long::class.javaPrimitiveType)
+        constructor.isAccessible = true
+        return constructor.newInstance(input, maxBytes) as InputStream
+    }
+
     @Test
-    fun testFetchAndParseEpgThrows304Exception() {
+    fun testFetchAndParseEpgThrows304Exception() = runBlocking {
         val context = io.mockk.mockk<android.content.Context>(relaxed = true)
         val okHttpClient = io.mockk.mockk<okhttp3.OkHttpClient>()
         val profileManager = io.mockk.mockk<com.arflix.tv.data.repository.ProfileManager>(relaxed = true)
@@ -186,17 +251,101 @@ class IptvRepositoryOptimizationTest {
         io.mockk.every { response.close() } returns Unit
         io.mockk.every { call.execute() } returns response
         io.mockk.every { customClient.newCall(any()) } returns call
+        io.mockk.every { call.enqueue(any()) } answers {
+            val callback = firstArg<okhttp3.Callback>()
+            callback.onResponse(call, response)
+        }
 
         val repository = IptvRepository(context, okHttpClient, profileManager, invalidationBus)
-        val method = IptvRepository::class.java.getDeclaredMethod("fetchAndParseEpg", String::class.java, List::class.java)
-        method.isAccessible = true
-
         try {
-            method.invoke(repository, "http://example.com/epg.xml", emptyList<com.arflix.tv.data.model.IptvChannel>())
+            callFetchAndParseEpgReflection(repository, "http://example.com/epg.xml", emptyList())
             fail("Expected EpgNotModifiedException to be thrown")
-        } catch (e: java.lang.reflect.InvocationTargetException) {
-            val cause = e.cause
+        } catch (e: Exception) {
+            val cause = if (e is java.lang.reflect.InvocationTargetException) e.cause else e
             assertEquals(IptvRepository.EpgNotModifiedException::class.java, cause?.javaClass)
         }
+    }
+
+    @Test
+    fun testBoundedInputStreamLimitExceeded() {
+        val data = "Hello World"
+        val raw = ByteArrayInputStream(data.toByteArray())
+        val bounded = createBoundedInputStream(raw, 5L)
+
+        val buffer = ByteArray(10)
+        try {
+            bounded.read(buffer)
+            fail("Expected SecurityException to be thrown")
+        } catch (e: SecurityException) {
+            // expected
+        } catch (e: java.lang.reflect.InvocationTargetException) {
+            val cause = e.cause
+            assertEquals(SecurityException::class.java, cause?.javaClass)
+        }
+    }
+
+    @Test
+    fun testParseM3uValidationAndFallback() = runBlocking {
+        val m3uData = """
+            #EXTM3U
+            #EXTINF:-1 tvg-id="ch1" tvg-name="Channel 1" group-title="Group A",
+            http://example.com/stream1.ts
+            #EXTINF:-1 tvg-id="ch2" tvg-name="" group-title="Group B",
+            https://example.com/stream2.ts
+            #EXTINF:-1 tvg-id="ch3" tvg-name="Bad Channel",
+            invalid_url_with spaces.ts
+        """.trimIndent()
+
+        val context = io.mockk.mockk<android.content.Context>(relaxed = true)
+        val okHttpClient = io.mockk.mockk<okhttp3.OkHttpClient>(relaxed = true)
+        val profileManager = io.mockk.mockk<com.arflix.tv.data.repository.ProfileManager>(relaxed = true)
+        val invalidationBus = io.mockk.mockk<com.arflix.tv.data.repository.CloudSyncInvalidationBus>(relaxed = true)
+        val repository = IptvRepository(context, okHttpClient, profileManager, invalidationBus)
+
+        val input = ByteArrayInputStream(m3uData.toByteArray(Charsets.UTF_8))
+        val onProgress: (IptvLoadProgress) -> Unit = {}
+        val channels = callParseM3uReflection(repository, input, onProgress)
+
+        assertEquals(2, channels.size)
+        assertEquals("Channel 1", channels[0].name)
+        assertEquals("Unknown Channel", channels[1].name)
+    }
+
+    @Test
+    fun testCacheEviction() {
+        val tempDir = java.nio.file.Files.createTempDirectory("iptv_cache_test").toFile()
+        val cacheDir = File(tempDir, "iptv_cache")
+        cacheDir.mkdirs()
+
+        val file1 = File(cacheDir, "profile1_iptv_cache.json")
+        val file2 = File(cacheDir, "profile1_iptv_channels_cache.json")
+        val file3 = File(cacheDir, "profile2_iptv_cache.json")
+
+        file1.writeBytes(ByteArray(45 * 1024 * 1024)) // 45 MB
+        file1.setLastModified(System.currentTimeMillis() - 10000)
+
+        file2.writeBytes(ByteArray(45 * 1024 * 1024)) // 45 MB
+        file2.setLastModified(System.currentTimeMillis() - 5000)
+
+        file3.writeBytes(ByteArray(25 * 1024 * 1024)) // 25 MB
+        file3.setLastModified(System.currentTimeMillis())
+
+        val context = io.mockk.mockk<android.content.Context>(relaxed = true)
+        io.mockk.every { context.filesDir } returns tempDir
+
+        val okHttpClient = io.mockk.mockk<okhttp3.OkHttpClient>(relaxed = true)
+        val profileManager = io.mockk.mockk<com.arflix.tv.data.repository.ProfileManager>(relaxed = true)
+        val invalidationBus = io.mockk.mockk<com.arflix.tv.data.repository.CloudSyncInvalidationBus>(relaxed = true)
+        val repository = IptvRepository(context, okHttpClient, profileManager, invalidationBus)
+
+        val method = IptvRepository::class.java.getDeclaredMethod("cleanupIptvCacheDirectory")
+        method.isAccessible = true
+        method.invoke(repository)
+
+        assertFalse(file1.exists())
+        assertTrue(file2.exists())
+        assertTrue(file3.exists())
+
+        tempDir.deleteRecursively()
     }
 }
