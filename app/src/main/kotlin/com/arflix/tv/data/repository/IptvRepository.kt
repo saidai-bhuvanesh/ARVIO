@@ -753,13 +753,8 @@ class IptvRepository @Inject constructor(
                 }
             }
 
-        // Add scheme if missing.
-        return if (cleaned.startsWith("http://", true) || cleaned.startsWith("https://", true)) {
-            cleaned.removeSuffix("/")
-        } else {
-            // Default to http (most providers use http).
-            "http://${cleaned.removeSuffix("/")}"
-        }
+        // Use NetworkUtils to enforce HTTPS scheme.
+        return com.arflix.tv.util.NetworkUtils.ensureHttps(cleaned)
     }
 
     private fun buildXtreamM3uUrl(baseUrl: String, username: String, password: String): String {

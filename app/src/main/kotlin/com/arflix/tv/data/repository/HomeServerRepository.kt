@@ -775,12 +775,9 @@ class HomeServerRepository @Inject constructor(
     private fun normalizeServerUrl(rawUrl: String): String {
         val trimmed = rawUrl.trim().trimEnd('/')
         if (trimmed.isBlank()) return ""
-        val withScheme = if (trimmed.startsWith("http://", true) || trimmed.startsWith("https://", true)) {
-            trimmed
-        } else {
-            "http://$trimmed"
-        }
-        return withScheme.toHttpUrlOrNull()?.toString()?.trimEnd('/').orEmpty()
+        // Ensure HTTPS scheme using NetworkUtils.
+        val secure = com.arflix.tv.util.NetworkUtils.ensureHttps(trimmed)
+        return secure.toHttpUrlOrNull()?.toString()?.trimEnd('/')?.orEmpty() ?: ""
     }
 
     private fun detectServerKind(productName: String, serverName: String): HomeServerKind {
