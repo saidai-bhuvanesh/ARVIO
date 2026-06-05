@@ -361,6 +361,126 @@ fun DetailsScreen(
         }
     }
 
+    val currentUiState = rememberUpdatedState(uiState)
+    val currentEpisodeIndex = rememberUpdatedState(episodeIndex)
+
+    val onButtonClickRemembered = remember(isMobile, mediaType, mediaId) {
+        { idx: Int ->
+            val state = currentUiState.value
+            val currentEpIdx = currentEpisodeIndex.value
+            when (idx) {
+                0 -> { // Play
+                    val season = if (mediaType == MediaType.TV) {
+                        state.playSeason
+                            ?: state.episodes.getOrNull(currentEpIdx)?.seasonNumber
+                            ?: 1
+                    } else null
+                    val episode = if (mediaType == MediaType.TV) {
+                        state.playEpisode
+                            ?: state.episodes.getOrNull(currentEpIdx)?.episodeNumber
+                            ?: 1
+                    } else null
+                    val startPositionMs = if (
+                        mediaType == MediaType.TV &&
+                        season == state.playSeason &&
+                        episode == state.playEpisode
+                    ) {
+                        state.playPositionMs
+                    } else if (mediaType == MediaType.MOVIE) {
+                        state.playPositionMs
+                    } else null
+
+                    if (!state.autoPlaySingleSource) {
+                        // Autoplay OFF → open the source picker; never auto-play.
+                        showStreamSelector = true
+                        viewModel.loadStreams(state.imdbId, season, episode)
+                    } else {
+                        // Autoplay ON → go straight to the player; PlayerScreen auto-picks.
+                        onNavigateToPlayer(
+                            mediaType, mediaId, season, episode,
+                            state.imdbId, null, null, null, startPositionMs
+                        )
+                    }
+                }
+                1 -> { // Sources
+                    showStreamSelector = true
+                    val ep = state.episodes.getOrNull(currentEpIdx)
+                    viewModel.loadStreams(state.imdbId, ep?.seasonNumber, ep?.episodeNumber)
+                }
+                2 -> { // Trailer
+                    state.trailerKey?.let { showTrailerPlayer = true }
+                }
+                3 -> viewModel.toggleWatched(currentEpIdx)
+                4 -> viewModel.toggleWatchlist()
+                5 -> { // View Collection — scroll to and focus the collection row on this page
+                    focusedSection = FocusSection.COLLECTION
+                    collectionIndex = 0
+                }
+            }
+        }
+    }
+
+    val onSeasonClickRemembered = remember {
+        { idx: Int ->
+            seasonIndex = idx
+            episodeIndex = 0
+            viewModel.loadSeason(idx + 1)
+        }
+    }
+
+    val onSeasonLongClickRemembered = remember {
+        { idx: Int ->
+            contextMenuSeason = idx + 1
+            showSeasonContextMenu = true
+        }
+    }
+
+    val onEpisodeClickRemembered = remember(isMobile, mediaType, mediaId) {
+        { idx: Int ->
+            val state = currentUiState.value
+            val ep = state.episodes.getOrNull(idx)
+            if (ep != null) {
+                episodeIndex = idx
+                if (isMobile || !state.autoPlaySingleSource) {
+                    showStreamSelector = true
+                    viewModel.loadStreams(state.imdbId, ep.seasonNumber, ep.episodeNumber)
+                } else {
+                    onNavigateToPlayer(
+                        mediaType, mediaId,
+                        ep.seasonNumber, ep.episodeNumber, state.imdbId, null, null, null, null
+                    )
+                }
+            }
+        }
+    }
+
+    val onCastClickRemembered = remember {
+        { idx: Int ->
+            val member = currentUiState.value.cast.getOrNull(idx)
+            if (member != null) {
+                viewModel.loadPerson(member.id)
+            }
+        }
+    }
+
+    val onSimilarClickRemembered = remember {
+        { idx: Int ->
+            val sim = currentUiState.value.similar.getOrNull(idx)
+            if (sim != null) {
+                onNavigateToDetails(sim.mediaType, sim.id)
+            }
+        }
+    }
+
+    val onCollectionClickRemembered = remember {
+        { idx: Int ->
+            val item = currentUiState.value.collectionItems.getOrNull(idx)
+            if (item != null) {
+                onNavigateToDetails(item.mediaType, item.id)
+            }
+        }
+    }
+
     // D-pad key handler — only used on TV (skipped on mobile/touch devices)
     val dpadRepeatGate = rememberArvioDpadRepeatGate(
         horizontalMinRepeatIntervalMs = 80L,
@@ -749,99 +869,13 @@ fun DetailsScreen(
                     isMobile = isMobile,
                     spoilerBlurEnabled = spoilerBlurEnabled,
                     onBack = onBack,
-                    onButtonClick = { idx ->
-                        when (idx) {
-                            0 -> { // Play
-                                val season = if (mediaType == MediaType.TV) {
-                                    uiState.playSeason
-                                        ?: uiState.episodes.getOrNull(episodeIndex)?.seasonNumber
-                                        ?: 1
-                                } else null
-                                val episode = if (mediaType == MediaType.TV) {
-                                    uiState.playEpisode
-                                        ?: uiState.episodes.getOrNull(episodeIndex)?.episodeNumber
-                                        ?: 1
-                                } else null
-                                val startPositionMs = if (
-                                    mediaType == MediaType.TV &&
-                                    season == uiState.playSeason &&
-                                    episode == uiState.playEpisode
-                                ) {
-                                    uiState.playPositionMs
-                                } else if (mediaType == MediaType.MOVIE) {
-                                    uiState.playPositionMs
-                                } else null
-
-                                if (!uiState.autoPlaySingleSource) {
-                                    // Autoplay OFF → open the source picker; never auto-play.
-                                    showStreamSelector = true
-                                    viewModel.loadStreams(uiState.imdbId, season, episode)
-                                } else {
-                                    // Autoplay ON → go straight to the player; PlayerScreen auto-picks.
-                                    onNavigateToPlayer(
-                                        mediaType, mediaId, season, episode,
-                                        uiState.imdbId, null, null, null, startPositionMs
-                                    )
-                                }
-                            }
-                            1 -> { // Sources
-                                showStreamSelector = true
-                                val ep = uiState.episodes.getOrNull(episodeIndex)
-                                viewModel.loadStreams(uiState.imdbId, ep?.seasonNumber, ep?.episodeNumber)
-                            }
-                            2 -> { // Trailer
-                                uiState.trailerKey?.let { showTrailerPlayer = true }
-                            }
-                            3 -> viewModel.toggleWatched(episodeIndex)
-                            4 -> viewModel.toggleWatchlist()
-                            5 -> { // View Collection — scroll to and focus the collection row on this page
-                                focusedSection = FocusSection.COLLECTION
-                                collectionIndex = 0
-                            }
-                        }
-                    },
-                    onSeasonClick = { idx ->
-                        seasonIndex = idx
-                        episodeIndex = 0
-                        viewModel.loadSeason(idx + 1)
-                    },
-                    onSeasonLongClick = { idx ->
-                        contextMenuSeason = idx + 1
-                        showSeasonContextMenu = true
-                    },
-                    onEpisodeClick = { idx ->
-                        val ep = uiState.episodes.getOrNull(idx)
-                        if (ep != null) {
-                            episodeIndex = idx
-                            if (isMobile || !uiState.autoPlaySingleSource) {
-                                showStreamSelector = true
-                                viewModel.loadStreams(uiState.imdbId, ep.seasonNumber, ep.episodeNumber)
-                            } else {
-                                onNavigateToPlayer(
-                                    mediaType, mediaId,
-                                    ep.seasonNumber, ep.episodeNumber, uiState.imdbId, null, null, null, null
-                                )
-                            }
-                        }
-                    },
-                    onCastClick = { idx ->
-                        val member = uiState.cast.getOrNull(idx)
-                        if (member != null) {
-                            viewModel.loadPerson(member.id)
-                        }
-                    },
-                    onSimilarClick = { idx ->
-                        val sim = uiState.similar.getOrNull(idx)
-                        if (sim != null) {
-                            onNavigateToDetails(sim.mediaType, sim.id)
-                        }
-                    },
-                    onCollectionClick = { idx ->
-                        val item = uiState.collectionItems.getOrNull(idx)
-                        if (item != null) {
-                            onNavigateToDetails(item.mediaType, item.id)
-                        }
-                    }
+                    onButtonClick = onButtonClickRemembered,
+                    onSeasonClick = onSeasonClickRemembered,
+                    onSeasonLongClick = onSeasonLongClickRemembered,
+                    onEpisodeClick = onEpisodeClickRemembered,
+                    onCastClick = onCastClickRemembered,
+                    onSimilarClick = onSimilarClickRemembered,
+                    onCollectionClick = onCollectionClickRemembered
                 )
             }
         }
@@ -2343,6 +2377,8 @@ private fun DetailsSeasonRail(
         }
     }
 
+    val currentOnSeasonClick = rememberUpdatedState(onSeasonClick)
+
     TvLazyRow(
         state = seasonRowState,
         modifier = Modifier.arvioDpadFocusGroup(enableFocusRestorer = false),
@@ -2366,8 +2402,8 @@ private fun DetailsSeasonRail(
             } else {
                 null
             }
-            val onClickForSeason = remember(index, onSeasonClick) {
-                { onSeasonClick(index) }
+            val onClickForSeason = remember(index) {
+                { currentOnSeasonClick.value(index) }
             }
             SeasonButton(
                 season = season,
@@ -2411,6 +2447,8 @@ private fun DetailsEpisodeRail(
     val currentFocusedSection by rememberUpdatedState(focusSectionForUi)
     val currentEpisodeIndex by rememberUpdatedState(episodeIndex)
 
+    val currentOnEpisodeClick = rememberUpdatedState(onEpisodeClick)
+
     Box(modifier = Modifier.fillMaxWidth()) {
         TvLazyRow(
             state = episodeRowState,
@@ -2433,8 +2471,8 @@ private fun DetailsEpisodeRail(
                 key = { index, ep -> "${ep.seasonNumber}_${ep.episodeNumber}_$index" }
             ) { index, episode ->
                 val isFocused = currentFocusedSection == FocusSection.EPISODES && index == currentEpisodeIndex
-                val onClickForEpisode = remember(index, onEpisodeClick) {
-                    { onEpisodeClick(index) }
+                val onClickForEpisode = remember(index) {
+                    { currentOnEpisodeClick.value(index) }
                 }
                 EpisodeCard(
                     episode = episode,
@@ -2475,6 +2513,8 @@ private fun DetailsCastRail(
         itemSpacing = 16.dp
     )
 
+    val currentOnCastClick = rememberUpdatedState(onCastClick)
+
     Column {
         Text(
             text = stringResource(R.string.cast),
@@ -2506,8 +2546,8 @@ private fun DetailsCastRail(
                 cast,
                 key = { index, c -> "${c.id}_${c.character}_$index" }
             ) { index, castMember ->
-                val onClickForCast = remember(index, onCastClick) {
-                    { onCastClick(index) }
+                val onClickForCast = remember(index) {
+                    { currentOnCastClick.value(index) }
                 }
                 CircularCastCard(
                     castMember = castMember,
@@ -2605,6 +2645,8 @@ private fun DetailsSimilarRail(
         itemSpacing = 14.dp
     )
 
+    val currentOnSimilarClick = rememberUpdatedState(onSimilarClick)
+
     Column {
         Text(
             text = stringResource(R.string.more_like_this),
@@ -2637,8 +2679,8 @@ private fun DetailsSimilarRail(
                     similar,
                     key = { index, m -> "${m.mediaType.name}_${m.id}_$index" }
                 ) { index, mediaItem ->
-                    val onClickForSimilar = remember(index, onSimilarClick) {
-                        { onSimilarClick(index) }
+                    val onClickForSimilar = remember(index) {
+                        { currentOnSimilarClick.value(index) }
                     }
                     SimilarMediaCard(
                         item = mediaItem,
@@ -2689,6 +2731,8 @@ private fun DetailsCollectionRail(
         itemSpacing = 14.dp
     )
 
+    val currentOnCollectionClick = rememberUpdatedState(onCollectionClick)
+
     Column {
         val displayName = collectionName ?: stringResource(R.string.more_like_this)
         Text(
@@ -2722,12 +2766,15 @@ private fun DetailsCollectionRail(
                     collectionItems,
                     key = { index, m -> "col_${m.mediaType.name}_${m.id}_$index" }
                 ) { index, mediaItem ->
+                    val onClickForCollection = remember(index) {
+                        { currentOnCollectionClick.value(index) }
+                    }
                     SimilarMediaCard(
                         item = mediaItem,
                         logoImageUrl = null,
                         usePosterCards = usePosterCards,
                         isFocused = focusSectionForUi == FocusSection.COLLECTION && index == collectionIndex && !collectionFixedFocus,
-                        onClick = { onCollectionClick(index) }
+                        onClick = onClickForCollection
                     )
                 }
             }

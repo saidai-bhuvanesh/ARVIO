@@ -2734,6 +2734,15 @@ private fun MobileHomeRowsLayer(
                                 onLoadMoreCategory(category.id)
                             }
                         }
+                        val currentItem = rememberUpdatedState(item)
+                        val onCardClick = remember {
+                            { onItemClick(currentItem.value) }
+                        }
+                        val onCardLongClick = if (onItemLongClick != null) {
+                            remember {
+                                { onItemLongClick(currentItem.value, isContinueWatching) }
+                            }
+                        } else null
                         if (isRanked && index < 10) {
                             Box(
                                 modifier = Modifier.width(rowMobileItemWidth)
@@ -2750,8 +2759,8 @@ private fun MobileHomeRowsLayer(
                                     isFocusedOverride = false,
                                     enableSystemFocus = false,
                                     onFocused = {},
-                                    onClick = { onItemClick(item) },
-                                    onLongClick = onItemLongClick?.let { callback -> { callback(item, isContinueWatching) } },
+                                    onClick = onCardClick,
+                                    onLongClick = onCardLongClick,
                                 )
                                 TopRankRibbon(
                                     rank = index + 1,
@@ -2776,8 +2785,8 @@ private fun MobileHomeRowsLayer(
                                 isFocusedOverride = false,
                                 enableSystemFocus = false,
                                 onFocused = {},
-                                onClick = { onItemClick(item) },
-                                onLongClick = onItemLongClick?.let { callback -> { callback(item, isContinueWatching) } },
+                                onClick = onCardClick,
+                                onLongClick = onCardLongClick,
                             )
                         }
                     }
@@ -2973,6 +2982,17 @@ private fun TvHomeRowsLayer(
                     val rowKey = remember(category.id) { "home:${category.id}" }
                     val rowUsePosterCards = rememberCatalogueRowLayoutMode(rowKey) == CardLayoutMode.POSTER
                     val rowHeight = if (rowUsePosterCards) 245.dp else 202.dp
+                    val onRowLoadMore = remember(category.id) {
+                        { onLoadMoreCategory(category.id) }
+                    }
+                    val onRowItemFocused = remember(actualRowIndex) {
+                        { item: MediaItem, itemIdx: Int ->
+                            focusState.currentRowIndex = actualRowIndex
+                            focusState.currentItemIndex = itemIdx
+                            focusState.isSidebarFocused = false
+                            focusState.lastNavEventTime = SystemClock.elapsedRealtime()
+                        }
+                    }
                     Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -2988,16 +3008,11 @@ private fun TvHomeRowsLayer(
                             startPadding = contentStartPadding,
                             categoryHasMore = categoryHasMoreMap[category.id] == true,
                             smoothScrolling = smoothScrolling,
-                            onLoadMore = { onLoadMoreCategory(category.id) },
+                            onLoadMore = onRowLoadMore,
                             focusedItemIndex = if (rowIsFocused) focusState.currentItemIndex else -1,
                             isFastScrolling = rowIsFocused && isFastScrolling,
                             onItemClick = onItemClick,
-                            onItemFocused = { item, itemIdx ->
-                                focusState.currentRowIndex = actualRowIndex
-                                focusState.currentItemIndex = itemIdx
-                                focusState.isSidebarFocused = false
-                                focusState.lastNavEventTime = SystemClock.elapsedRealtime()
-                            }
+                            onItemFocused = onRowItemFocused
                         )
                     }
                 }
@@ -3394,11 +3409,12 @@ private fun ContentRow(
                     }
                 }
                 val itemIsFocused = isCurrentRow && index == focusedCardIndex
-                val onCardFocused = remember(item, index) {
-                    { latestOnItemFocused.value(item, index) }
+                val currentItem = rememberUpdatedState(item)
+                val onCardFocused = remember(index) {
+                    { latestOnItemFocused.value(currentItem.value, index) }
                 }
-                val onCardClick = remember(item) {
-                    { latestOnItemClick.value(item) }
+                val onCardClick = remember {
+                    { latestOnItemClick.value(currentItem.value) }
                 }
                 if (isRanked && index < 10) {
                     // Top 10 rows should use the SAME card sizing as every other row.
